@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>蓝奏切片</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" type="module"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img class="logo" src="assets/app-icon.svg" width="34" height="34" alt="" aria-hidden="true"><h1>蓝奏切片</h1></div>
+    <div class="header-tags"><span>80 MiB 分片</span><span>校验后合并</span><span id="app-version">桌面版</span></div>
+  </header>
+  <main>
+    <aside class="account-panel panel">
+      <div class="section-title"><span class="account-icon" data-icon="account" aria-hidden="true"></span><h2>蓝奏云账号</h2></div>
+      <p id="account-status" class="account-status" role="status">未登录</p>
+      <form id="login-form">
+        <label for="account">账号</label><input id="account" autocomplete="username" placeholder="蓝奏云账号" required maxlength="128">
+        <label for="password">密码</label><input id="password" type="password" autocomplete="current-password" placeholder="输入账号密码" required maxlength="256">
+        <label class="checkbox"><input id="remember" type="checkbox"> 在此电脑记住登录</label>
+        <button id="login" class="primary full" type="submit">登录蓝奏云</button>
+      </form>
+      <details id="account-options" class="account-options" open><summary>网页登录与会话</summary><div class="login-options"><button id="official-login" class="secondary full">打开官网登录窗口</button><button id="confirm-login" class="text-button">我已登录，检测会话</button></div></details>
+      <button id="logout" class="secondary full" hidden>退出账号</button>
+      <details class="privacy-note"><summary>登录与隐私</summary><p>密码仅用于本次登录。记住登录时，会话由 Windows 加密保存在本机。</p></details>
+      <button id="open-data" class="text-button data-button">打开本地任务目录</button>
+    </aside>
+    <section class="workspace">
+      <nav class="tabs" aria-label="传输模式"><button id="tab-upload" class="tab active" aria-selected="true">切片上传</button><button id="tab-download" class="tab" aria-selected="false">下载与合并</button><button id="tab-transfers" class="tab" aria-selected="false">上传下载</button><button id="tab-settings" class="tab" aria-selected="false">设置与清理</button></nav>
+      <section id="upload-panel" class="panel operation-panel">
+        <div class="upload-heading"><h2>上传文件</h2><span id="upload-concurrency-label" class="muted small">上传并发 2 路</span></div>
+        <button id="choose-source" class="file-picker"><span class="file-icon" data-icon="upload" aria-hidden="true"></span><strong id="source-name">点击选择文件，或拖到这里</strong><span id="source-path">已登录且空闲时，拖入即上传</span><span id="source-size" class="source-size" hidden></span></button>
+        <div class="spec-row"><span>单片上限 <b>80 MiB</b></span><span>自动建立目录</span><span>保留原始文件名</span></div>
+        <div class="action-row"><p id="upload-hint" class="muted">请先登录并选择文件。</p><button id="start-upload" class="primary" disabled>切片并上传 <span data-icon="upload" aria-hidden="true"></span></button></div>
+      </section>
+      <section id="download-panel" class="panel operation-panel" hidden>
+        <div class="download-heading"><h2>文件下载</h2><div id="browser-views" class="source-switch" role="group" aria-label="网盘显示模式"><button id="view-smart" class="chip selected" aria-pressed="true" title="自动识别切片文件夹，显示原文件名并支持下载合并">智能识别</button><button id="view-raw" class="chip" aria-pressed="false" title="查看网盘实际的文件夹、切片和清单">原始网盘</button></div><div class="source-switch"><button id="account-source" class="chip selected">我的蓝奏云</button><button id="share-source" class="chip">文件夹分享链接</button></div></div>
+        <div id="account-browser">
+          <div class="browser-toolbar"><button id="folder-up" class="secondary compact">返回上级</button><span id="folder-path" title="根目录">根目录</span><button id="new-folder" class="secondary compact" disabled>新建文件夹</button><button id="refresh-folders" class="text-button">刷新目录</button><button id="inspect-folder" class="secondary compact" title="读取当前目录的切片清单" disabled>读取清单</button></div>
+          <div id="folder-list" class="folder-list" tabindex="0" aria-label="云端文件列表"><p class="muted">登录后点击“刷新目录”。</p></div>
+          <div class="directory-pagination"><div class="directory-metadata"><small id="directory-status" class="muted" role="status"></small><small id="recognition-status" class="muted" role="status"></small></div><div class="selection-actions"><small id="selection-count" class="muted" role="status" title="点击行空白处单选；Ctrl+点击增减选择；Shift+点击连续选择；Ctrl+Shift+点击追加范围">已选 0 项</small><button id="clear-selection" class="text-button" disabled>清除选择</button><button id="download-selected" class="secondary compact" disabled>下载所选（0）</button><button id="load-more" class="text-button" hidden>加载更多</button></div></div>
+        </div>
+        <form id="share-form" hidden>
+          <label for="share-url">文件夹分享链接</label><input id="share-url" type="url" placeholder="https://…lanzou…/…" autocomplete="off" required>
+          <div class="share-row"><div><label for="share-password">提取码（如有）</label><input id="share-password" maxlength="128" placeholder="选填；继续分享任务时也在这里填写"></div><button class="secondary" type="submit">读取清单</button></div>
+        </form>
+        <div id="bundle-summary" class="bundle-summary" hidden></div>
+        <div class="download-settings"><button id="choose-directory" class="secondary">选择保存目录</button><span id="output-directory" class="muted">尚未选择</span><label for="concurrency">并发</label><select id="concurrency" title="更改后也保存为默认下载并发"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select><button id="start-download" class="primary" title="全部切片校验后自动合并，不覆盖已有文件" disabled>下载并合并 <span data-icon="download" aria-hidden="true"></span></button></div>
+      </section>
+      <section id="settings-panel" class="panel operation-panel" hidden>
+        <h2>设置与清理</h2>
+        <p class="muted small">目录设置自动保存，重新打开软件后继续使用。</p>
+        <p id="settings-warning" class="muted small" role="status" hidden></p>
+        <div class="setting-row concurrency-setting"><div><h3>传输并发</h3><p class="muted small">多个切片同时上传或下载，每项可设 1–8 路。设置自动保存，供新任务和暂停后继续的任务使用。</p><small class="muted">运行中的任务保持原并发；实际路数不超过切片数。上传缓存约按并发路数增长。</small></div><div class="concurrency-fields"><label for="upload-concurrency">上传并发<select id="upload-concurrency"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select></label><label for="download-concurrency">下载并发<select id="download-concurrency"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select></label></div></div>
+        <div class="setting-row"><div><h3>默认下载目录</h3><p id="setting-download-dir" class="setting-path"></p><small class="muted">合并后的原文件保存在这里；已创建任务保持原保存位置。</small></div><button id="set-download-dir" class="secondary">更改目录</button></div>
+        <div class="setting-row"><div><h3>切片缓存目录</h3><p id="setting-cache-dir" class="setting-path"></p><small class="muted">新任务使用此位置。已有任务保留原缓存位置，可继续恢复。</small></div><button id="set-cache-dir" class="secondary">更改目录</button></div>
+        <div class="setting-row"><div><h3>自动清理缓存</h3><label class="checkbox"><input id="auto-clean-cache" type="checkbox" checked> 完成传输及校验后自动清理临时切片</label><small class="muted">启动时也会清理已完成任务的残留切片；暂停、失败和运行中的数据保留。</small></div></div>
+        <div class="setting-row"><div><h3>缓存管理</h3><p id="cache-status" class="muted small" role="status">点击刷新查看缓存占用。</p><small class="muted">仅清理本软件已完成任务的缓存，不删除原文件、合并结果或登录信息。</small></div><div class="setting-actions"><button id="refresh-cache" class="text-button">刷新占用</button><button id="clean-cache" class="secondary">清理缓存</button></div></div>
+        <div class="setting-row"><div><h3>历史记录</h3><p class="muted small">可清理已完成记录，或清空全部已结束历史（含失败记录及其恢复缓存）。运行和暂停任务、原文件与下载结果保留。</p></div><div class="setting-actions"><button id="clear-history-settings" class="secondary">清空已完成</button><button id="clear-all-history-settings" class="secondary">清空全部历史</button></div></div>
+      </section>
+      <section id="transfers-panel" class="panel operation-panel" hidden>
+        <div class="transfer-heading"><div><h2>上传下载 <span id="task-count" class="task-count">0</span></h2><p id="transfer-summary" class="muted small">统一管理传输与历史记录</p></div><div class="setting-actions"><button id="show-floating" class="secondary" disabled>显示浮窗</button><button id="pause-all" class="secondary" disabled>暂停全部</button></div></div>
+        <div class="transfer-toolbar"><label for="transfer-type">类型<select id="transfer-type"><option value="all">全部类型</option><option value="upload">上传</option><option value="download">下载</option></select></label><label for="transfer-state">状态<select id="transfer-state"><option value="all">全部状态</option><option value="running">进行中</option><option value="queued">排队中</option><option value="paused">已暂停</option><option value="failed">失败</option><option value="completed">已完成</option></select></label><div class="transfer-clean"><button id="clear-history" class="text-button">清空已完成</button><button id="clear-all-history" class="secondary" title="清除已完成和失败记录及恢复缓存；运行和暂停任务保留">清空全部历史</button></div></div>
+        <p class="history-note muted">全部历史包含已完成和失败记录；运行、排队、暂停任务保留。清除失败记录后无法从原缓存继续。</p>
+        <div id="tasks" tabindex="0" aria-label="上传下载任务"><div class="empty-state">暂无传输任务</div></div>
+      </section>
+      <footer>基于 YunX · AGPL-3.0 · 凭证仅保存在本机</footer>
+    </section>
+  </main>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <div id="file-menu" class="file-menu" popover="auto" role="menu" aria-label="文件管理"></div>
+  <dialog id="cloud-dialog" class="cloud-dialog" aria-labelledby="cloud-dialog-title" aria-describedby="cloud-dialog-description">
+    <form id="cloud-form">
+      <h2 id="cloud-dialog-title">文件管理</h2>
+      <p id="cloud-dialog-description" class="muted small"></p>
+      <ul id="cloud-delete-list" class="cloud-delete-list small" aria-label="将删除的云端项目" hidden></ul>
+      <div id="cloud-name-field"><label for="cloud-name">名称</label><input id="cloud-name" maxlength="255" autocomplete="off" required></div>
+      <p id="cloud-dialog-error" class="dialog-error small" role="alert" hidden></p>
+      <div class="dialog-actions"><button id="cloud-cancel" class="secondary" type="button">取消</button><button id="cloud-confirm" class="primary" type="submit">保存</button></div>
+    </form>
+  </dialog>
+  <aside id="floating-transfer" class="floating-transfer panel" aria-label="实时传输进度" hidden>
+    <div class="floating-heading"><button id="floating-open" class="text-button">上传下载</button><span id="floating-state" class="task-status"></span><button id="floating-toggle" class="text-button" aria-label="收起传输浮窗" aria-expanded="true">收起</button><button id="floating-close" class="text-button" aria-label="隐藏传输浮窗" title="隐藏传输浮窗" data-icon="close"></button></div>
+    <div class="floating-body"><button id="floating-name" class="floating-name" aria-label="打开当前任务所在文件夹"></button><div class="transfer-progress"><small id="floating-bytes"></small><progress id="floating-progress" max="1" aria-label="当前任务进度"></progress><span id="floating-percent">0%</span></div><div class="transfer-metrics"><div><small>速度</small><strong id="floating-speed">0.00 B/s</strong></div><div><small>已用时间</small><strong id="floating-elapsed">00:00:00</strong></div><div><small>预计剩余</small><strong id="floating-remaining">—</strong></div></div><div class="floating-actions"><p id="floating-message" class="floating-message"></p><button id="floating-folder" class="text-button">打开所在文件夹</button><button id="floating-action" class="text-button">暂停</button></div></div>
+  </aside>
+</body>
+</html>

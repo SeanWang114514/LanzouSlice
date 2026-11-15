@@ -1,0 +1,27 @@
+{
+  "name": "lanzou-slice-desktop",
+  "version": "0.1.20",
+  "description": "蓝奏切片：80 MiB 分片上传、并发下载与校验合并",
+  "private": true,
+  "type": "module",
+  "main": "src/main.mjs",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "start": "electron .",
+    "build:icons": "electron scripts/build-icons.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:large": "node scripts/large-roundtrip.mjs",
+    "test:desktop": "electron . --smoke-test",
+    "test:features": "node scripts/desktop-read-drop.mjs",
+    "package": "node scripts/package.mjs"
+  },
+  "dependencies": {
+    "tough-cookie": "6.1.0",
+    "yauzl": "3.4.0",
+    "yazl": "3.3.1"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "45.3.2"
+  }
+}
