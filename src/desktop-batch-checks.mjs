@@ -99,19 +99,24 @@ export async function checkBatchDownloads(window, { evaluate, until, capture, fi
     const state = await evaluate(`window.lanzou.call('state')`), destination = path.join(state.settings.downloadDir, path.basename(firstFile));
     await rename(destination, path.join(state.settings.downloadDir, 'earlier-fixture-result.exe'));
     await evaluate(`window.__batchEvents=[];window.__batchOff=window.lanzou.onState(s=>window.__batchEvents.push(s.tasks.map(t=>({id:t.id,state:t.state}))));document.querySelector('#download-selected').click()`);
-    await until(`window.lanzou.call('state').then(s=>s.tasks.length===3&&s.tasks.every(t=>t.state==='completed'))`, 18000);
+    await until(`window.lanzou.call('state').then(s=>s.tasks.length===3&&s.tasks.some(t=>t.state==='running'))`);
+    await until(`!document.querySelector('.folder-row[data-entry-kind="file"][data-entry-id="9100"] [data-download-file]').disabled`);
+    assert.equal(await evaluate(`document.querySelector('#start-upload').disabled||document.querySelector('.select-download').disabled`), false, '已有下载时仍可添加上传或切片下载');
+    await evaluate(`document.querySelector('.folder-row[data-entry-kind="file"][data-entry-id="9100"] [data-download-file]').click()`);
+    await until(`window.lanzou.call('state').then(s=>s.tasks.length===4&&s.tasks.some(t=>t.source?.file?.id==='9100'&&t.state==='queued'))`);
+    await until(`window.lanzou.call('state').then(s=>s.tasks.length===4&&s.tasks.every(t=>t.state==='completed'))`, 18000);
     await until(count('已选 0 项'));
     const completed = await evaluate(`window.lanzou.call('state').then(s=>s.tasks)`), events = await evaluate(`window.__batchOff();window.__batchEvents`);
     assert.ok(events.some(tasks => tasks.some(task => task.state === 'queued')));
     assert.ok(events.every(tasks => tasks.filter(task => task.state === 'running').length <= 1));
     assert.deepEqual(await readFile(destination), await readFile(firstFile));
-    for (const [name, value] of [['批量文档一.txt', 43], ['批量文档二.txt', 44]]) assert.deepEqual(await readFile(path.join(state.settings.downloadDir, name)), Buffer.alloc(128 * 1024, value));
-    await evaluate(`document.querySelector('#tab-transfers').click()`); assert.equal(await evaluate(`document.querySelectorAll('#tasks .task').length`), 3);
+    for (const [name, value] of [['批量文档一.txt', 43], ['批量文档二.txt', 44], ['第一页文件-01.bin', 45]]) assert.deepEqual(await readFile(path.join(state.settings.downloadDir, name)), Buffer.alloc(128 * 1024, value));
+    await evaluate(`document.querySelector('#tab-transfers').click()`); assert.equal(await evaluate(`document.querySelectorAll('#tasks .task').length`), 4);
     await evaluate(`{const input=document.querySelector('#transfer-state');input.value='queued';input.dispatchEvent(new Event('change',{bubbles:true}));}`);
     assert.equal(await evaluate(`document.querySelectorAll('#tasks .task:not([hidden])').length`), 0);
     await evaluate(`{const input=document.querySelector('#transfer-state');input.value='all';input.dispatchEvent(new Event('change',{bubbles:true}));}document.querySelector('#clear-all-history').click()`);
     await until(`document.querySelector('#task-count').textContent==='0'`);
-    const features = { ctrlClickSelection: true, shiftRangeSelection: true, ctrlShiftRangeSelection: true, modifierCheckboxSelection: true, modifierPaginationAnchor: true, modifierAnchorReset: true, modifierActionIsolation: true, rangeSelectionLimit: true, multiSelectCheckboxes: true, selectAllLoadedDownloads: true, selectionAcrossPagination: true, selectionClearedOnNavigation: true, selectionClearedOnModeSwitch: true, ordinaryFoldersNotBatchDownloaded: true, mixedBatchDownloads: true, backgroundDownloadQueue: true, responsiveMultiSelect: true };
+    const features = { ctrlClickSelection: true, shiftRangeSelection: true, ctrlShiftRangeSelection: true, modifierCheckboxSelection: true, modifierPaginationAnchor: true, modifierAnchorReset: true, modifierActionIsolation: true, rangeSelectionLimit: true, multiSelectCheckboxes: true, selectAllLoadedDownloads: true, selectionAcrossPagination: true, selectionClearedOnNavigation: true, selectionClearedOnModeSwitch: true, ordinaryFoldersNotBatchDownloaded: true, mixedBatchDownloads: true, backgroundDownloadQueue: true, responsiveMultiSelect: true, busySingleDownloadQueues: true, busyTransferControlsEnabled: true };
     await writeFile(path.join(outputDir, 'batch-download-checks.json'), JSON.stringify({ features, modifierInput: 'native Chromium mouseDown/up via Electron sendInputEvent with control/shift modifiers', rangeLimitFixture: { availableFiles: 220, maximumSelected: 200 }, completed: completed.map(task => ({ name: task.originalName, state: task.state, concurrency: task.concurrency, downloadKind: task.downloadKind || 'slice' })), queuedObserved: true, singleRunningTransfer: true, resultBytesMatch: true, layouts }, null, 2));
     return { features, layouts };
   } finally { window.setContentSize(...size); }

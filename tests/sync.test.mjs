@@ -67,9 +67,9 @@ test('failed replacement retains old version, pending receipts survive history c
   const { source, sync, mock, put, engine } = await fixture(t, { pageReply({ url }) { if (fail && url.pathname === '/html5up.php') return { json: { zt: 9 } }; } });
   const file = path.join(source, 'a'); await writeFile(file, 'old'); const id = await put(), rule = await run(sync, id), old = rule.entries.a.id;
   await writeFile(file, 'new'); fail = true; rule.requested = true; await sync.tick(); assert.equal(rule.state, 'error'); assert.equal(rule.entries.a.id, old); assert.equal(mock.folders.has(old), true);
-  const pending = rule.pending.id; await engine.clearHistory({ scope: 'all' }); assert.ok(engine.tasks.has(pending));
+  const pending = rule.pending[0].id; await engine.clearHistory({ scope: 'all' }); assert.ok(engine.tasks.has(pending));
   fail = false; await sync.client.login('test', 'only-for-fixture');
-  const restarted = new SyncManager({ engine }); await restarted.init(); await run(restarted, id); assert.equal(restarted.own(id).pending, null); assert.equal(mock.folders.has(old), false); await restarted.close();
+  const restarted = new SyncManager({ engine }); await restarted.init(); await run(restarted, id); assert.deepEqual(restarted.own(id).pending, []); assert.equal(mock.folders.has(old), false); await restarted.close();
 });
 test('lost create and upload replies resume the same version without duplicate content', async t => {
   const { source, sync, mock, put } = await fixture(t, { uncertainFolderCreate: true, uncertainUpload: true }); await writeFile(path.join(source, 'a'), 'same');
@@ -81,12 +81,14 @@ test('overlap is rejected and foreign accounts cannot run or remove rules', asyn
   await assert.rejects(put({ sourcePath: path.join(source, 'a') }), /重叠/);
   const uid = client.uid; client.uid = 'another'; assert.equal(sync.publicState().rules.length, 0); await assert.rejects(sync.remove(id), /当前账号/); await assert.rejects(sync.request(id), /当前账号/); client.uid = uid;
 });
-test('manual transfers and management are excluded during scan, multiple triggers do not reenter', async t => {
+test('manual transfers queue during sync scanning, multiple triggers do not reenter', async t => {
   const { source, sync, put, engine } = await fixture(t); const file = path.join(source, 'a'); await writeFile(file, 'x'); const id = await put();
   let release; const gate = new Promise(resolve => { release = resolve; }), original = sync.scan.bind(sync);
   sync.scan = async (...args) => { await gate; return original(...args); };
   sync.own(id).requested = true; const running = sync.tick(); assert.equal(engine.syncOwner, id);
-  await assert.rejects(engine.createUpload(file), /自动同步/); await sync.tick(); release(); await running; assert.equal(engine.tasks.size, 1);
+  const manual = await engine.createUpload(file); assert.equal(engine.tasks.get(manual).state, 'queued'); assert.equal(engine.active.size, 0);
+  await sync.tick(); release(); await running; await engine.active.get(manual)?.promise;
+  assert.equal(engine.tasks.size, 2); assert.equal(engine.tasks.get(manual).state, 'completed');
 });
 test('overdue plans coalesce once and disabled rules stay stopped', async t => {
   const { source, sync, put } = await fixture(t); await writeFile(path.join(source, 'a'), 'x'); const id = await put();
@@ -119,7 +121,7 @@ test('missing cloud root or a missing part repairs only the affected version', a
 test('pending task snapshot alone can recover after its task journal is lost', async t => {
   let fail = true;
   const { source, sync, mock, put, engine } = await fixture(t, { pageReply({ url }) { if (fail && url.pathname === '/html5up.php') return { json: { zt: 9 } }; } });
-  await writeFile(path.join(source, 'a'), 'data'); const id = await put(), rule = sync.own(id); rule.requested = true; await sync.tick(); const pending = rule.pending;
+  await writeFile(path.join(source, 'a'), 'data'); const id = await put(), rule = sync.own(id); rule.requested = true; await sync.tick(); const pending = rule.pending[0];
   await rm(engine.taskDir(pending.id), { recursive: true, force: true }); engine.tasks.delete(pending.id); fail = false; await sync.client.login('test', 'only-for-fixture');
   const recovered = new SyncManager({ engine }); await recovered.init(); await run(recovered, id); assert.equal(mock.uploads.get('part-000001.zip'), 1); await recovered.close();
 });
@@ -127,7 +129,7 @@ test('pause stops a rule and resumes without duplicate acknowledged parts', asyn
   const { source, sync, mock, put } = await fixture(t, { uploadDelay: 180 }); await writeFile(path.join(source, 'a'), Buffer.alloc(20000, 1)); const id = await put();
   sync.own(id).requested = true; const running = sync.tick();
   for (let i = 0; i < 300 && !mock.uploads.has('part-000001.zip'); i++) await delay(10);
-  await sync.toggle(id, false); await running; const rule = sync.own(id); assert.equal(rule.enabled, false); assert.equal(rule.state, 'paused'); assert.ok(rule.pending);
+  await sync.toggle(id, false); await running; const rule = sync.own(id); assert.equal(rule.enabled, false); assert.equal(rule.state, 'paused'); assert.ok(rule.pending.length);
   await utimes(path.join(source, 'a'), new Date(), new Date(Date.now() + 5000));
   sync.suspended = false; await run(sync, id); assert.equal(mock.uploads.get('part-000001.zip'), 1);
 });
@@ -161,4 +163,80 @@ test('account changes while a rule is being created cannot save a cross-account 
   const { source, sync, client } = await fixture(t); const uid = client.uid;
   const pending = sync.put({ sourcePath: source, schedule: { kind: 'interval', minutes: 10 } }); client.uid = 'other';
   await assert.rejects(pending, /账号已变化/); assert.equal(sync.rules.length, 0); client.uid = uid;
+});
+
+async function until(check) {
+  const deadline = Date.now() + 10000;
+  while (!check()) { assert.ok(Date.now() < deadline, '同步条件等待超时'); await delay(10); }
+}
+
+test('single-part sync files upload concurrently within the configured shared budget', async t => {
+  const { source, sync, mock, put, engine } = await fixture(t, { uploadDelay: 120 });
+  await engine.storage.configure({ uploadConcurrency: 3 });
+  for (let i = 0; i < 6; i++) await writeFile(path.join(source, `${i}.txt`), Buffer.alloc(3000, i));
+  const id = await put(), rule = await run(sync, id);
+  assert.equal(mock.maxUploads, 3); assert.equal(rule.stats.added, 6); assert.equal(rule.pending.length, 0);
+  const progress = sync.publicState().rules[0].progress;
+  assert.equal(progress.totalBytes, 18000); assert.equal(progress.processedBytes, 18000); assert.equal(progress.processedFiles, 6); assert.equal(progress.ratio, 1); assert.equal(progress.remainingSeconds, 0); assert.ok(progress.transferredBytes > 18000);
+  const count = mock.uploadOrder.length; await run(sync, id);
+  const unchanged = sync.publicState().rules[0].progress;
+  assert.equal(mock.uploadOrder.length, count); assert.equal(unchanged.skippedBytes, 18000); assert.equal(unchanged.uploadBytes, 0); assert.equal(unchanged.transferredBytes, 0); assert.equal(unchanged.speedBytesPerSecond, 0); assert.equal(unchanged.ratio, 1);
+});
+
+test('mixed sync files share the chunk limit and expose whole-round network metrics while manual work queues', async t => {
+  const { source, sync, mock, put, engine } = await fixture(t, { uploadDelay: 140 });
+  await engine.storage.configure({ uploadConcurrency: 2 });
+  await writeFile(path.join(source, 'large'), Buffer.alloc(90000, 7)); await writeFile(path.join(source, 'small'), Buffer.alloc(2000, 8));
+  const id = await put(); sync.own(id).requested = true; const running = sync.tick();
+  let p = sync.publicState().rules[0].progress;
+  assert.equal(p.totalKnown, false); assert.equal(p.remainingSeconds, null); assert.equal(p.speedBytesPerSecond, 0);
+  await until(() => { p = sync.publicState().rules[0].progress; return p.speedBytesPerSecond > 0 && p.remainingSeconds > 0; });
+  assert.equal(p.totalBytes, 92000); assert.equal(p.totalFiles, 2); assert.equal(p.concurrency, 2); assert.ok(p.processedBytes > 0 && p.processedBytes < 92000); assert.ok(p.ratio > 0 && p.ratio < 1);
+  const manual = await engine.createUpload(path.join(source, 'small')); assert.equal(engine.tasks.get(manual).state, 'queued');
+  await running; assert.equal(sync.own(id).state, 'idle', sync.own(id).error); assert.equal(mock.maxUploads, 2);
+  await engine.active.get(manual)?.promise; assert.equal(engine.tasks.get(manual).state, 'completed');
+});
+
+test('pausing parallel sync journals every pending file and restart resumes without duplicate receipts', async t => {
+  const { source, sync, mock, put, engine } = await fixture(t, { uploadDelay: 150 });
+  await engine.storage.configure({ uploadConcurrency: 2 });
+  for (let i = 0; i < 4; i++) await writeFile(path.join(source, `${i}`), Buffer.alloc(50000, i));
+  const id = await put(); sync.own(id).requested = true; const running = sync.tick();
+  await until(() => mock.maxUploads === 2 && mock.uploadOrder.length >= 2);
+  await sync.toggle(id, false); await running;
+  const rule = sync.own(id), receipts = new Set([...mock.files.values()].filter(file => file.name.startsWith('part-')).map(file => `${file.folderId}/${file.name}`));
+  assert.equal(rule.state, 'paused'); assert.ok(rule.pending.length >= 2); assert.equal(engine.active.size, 0);
+  const stopped = sync.publicState().rules[0].progress; assert.equal(stopped.speedBytesPerSecond, 0); assert.equal(stopped.remainingSeconds, null); assert.ok(stopped.ratio < 1);
+  await engine.clearHistory({ scope: 'all' }); for (const pending of rule.pending) assert.ok(engine.tasks.has(pending.id));
+  const restarted = new SyncManager({ engine }); await restarted.init(); await run(restarted, id);
+  assert.equal(restarted.own(id).stats.added, 4); assert.equal(restarted.own(id).pending.length, 0);
+  for (const key of receipts) assert.equal([...mock.files.values()].filter(file => `${file.folderId}/${file.name}` === key).length, 1);
+  assert.equal(mock.maxUploads, 2); await restarted.close();
+});
+
+test('legacy single-pending journals migrate and resumed sync adopts the current concurrency', async t => {
+  const { source, sync, mock, put, engine } = await fixture(t, { uploadDelay: 120 });
+  await engine.storage.configure({ uploadConcurrency: 1 }); await writeFile(path.join(source, 'legacy'), Buffer.alloc(60000, 1));
+  const id = await put(); sync.own(id).requested = true; const running = sync.tick();
+  await until(() => mock.uploadOrder.length >= 1); await sync.toggle(id, false); await running;
+  const journal = JSON.parse(await readFile(sync.file, 'utf8')); journal.version = 1; journal.rules[0].pending = journal.rules[0].pending[0];
+  await writeFile(sync.file, JSON.stringify(journal)); await engine.storage.configure({ uploadConcurrency: 3 }); mock.resetUploadPeak();
+  const restarted = new SyncManager({ engine }); await restarted.init(); const taskId = restarted.own(id).pending[0].id;
+  await run(restarted, id); assert.equal(engine.tasks.get(taskId).concurrency, 3); assert.equal(mock.maxUploads, 3); assert.equal(mock.uploads.get('part-000001.zip'), 1);
+  assert.equal(JSON.parse(await readFile(sync.file, 'utf8')).version, 2); await restarted.close();
+});
+
+test('a parallel upload failure retains old baselines and all pending versions for safe retry', async t => {
+  let fail = false;
+  const { source, sync, mock, put, engine } = await fixture(t, { uploadDelay: 100, pageReply({ url }) { if (fail && url.pathname === '/html5up.php') { fail = false; return { json: { zt: 9 } }; } } });
+  await engine.storage.configure({ uploadConcurrency: 2 });
+  for (const name of ['a', 'b']) await writeFile(path.join(source, name), 'old');
+  const id = await put(), rule = await run(sync, id), old = Object.values(rule.entries).map(entry => entry.id);
+  for (const name of ['a', 'b']) await writeFile(path.join(source, name), Buffer.alloc(20000, 3));
+  fail = true; rule.requested = true; await sync.tick();
+  assert.equal(rule.state, 'error'); assert.equal(engine.active.size, 0); assert.equal(rule.pending.length, 2);
+  assert.deepEqual(Object.values(rule.entries).map(entry => entry.id), old); for (const id of old) assert.ok(mock.folders.has(id));
+  await engine.client.login('test', 'only-for-fixture'); const restarted = new SyncManager({ engine }); await restarted.init();
+  await run(restarted, id); assert.equal(restarted.own(id).stats.updated, 2); for (const id of old) assert.equal(mock.folders.has(id), false);
+  await restarted.close();
 });

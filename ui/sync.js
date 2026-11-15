@@ -1,6 +1,20 @@
+import { roundedBytes, duration } from './transfer-format.js';
+import { setText } from './dom.js';
+
+export const syncActive = rule => ['scanning', 'uploading', 'cleaning'].includes(rule.state);
+export function syncProgress(rule) {
+  const p = rule.progress || {}, known = Boolean(p.totalKnown), finished = rule.state === 'idle' && p.finished;
+  return { known, ratio: p.ratio || 0, percent: known ? `${Math.floor((p.ratio || 0) * 100)}%` : rule.state === 'scanning' ? '扫描中' : '—',
+    bytes: known ? `${roundedBytes(p.processedBytes)} / ${roundedBytes(p.totalBytes)}` : `已扫描 ${p.scannedFiles || 0} 个 · ${roundedBytes(p.scannedBytes)}`,
+    detail: !known ? '正在扫描并比对，完成后显示总大小' : `已处理 ${p.processedFiles || 0}/${p.totalFiles || 0} 个 · 并行 ${p.activeFiles || 0} 个 · 上限 ${p.concurrency || 1} 路`,
+    speed: roundedBytes(p.speedBytesPerSecond, true), elapsed: duration((p.elapsedMs || 0) / 1000), remaining: finished ? '00:00:00' : duration(p.remainingSeconds),
+    message: rule.error || (finished ? '本轮同步完成' : rule.state === 'cleaning' ? '正在检查删除并清理旧版' : rule.state === 'queued' ? '等待传输队列空闲' : rule.currentFile || '等待下次同步') };
+}
+
 export function createSyncUI({ api, run, notice, make, getState }) {
   const $ = id => document.getElementById(id);
-  let editing = null, target = { id: '-1', name: '根目录' }, lastKey = '', lastOwner;
+  let editing = null, target = { id: '-1', name: '根目录' }, lastOwner;
+  const cards = new Map();
   let targetHistory = [], targetPage = 0, targetBusy = false, targetRequest = 0, resolveConfirm;
   const date = time => time ? new Date(time).toLocaleString('zh-CN', { hour12: false }) : '尚未执行';
   const states = { idle: '等待计划', queued: '等待空闲', scanning: '扫描比对', uploading: '同步上传', cleaning: '清理旧版', error: '需要重试', paused: '已暂停' };
@@ -70,31 +84,73 @@ export function createSyncUI({ api, run, notice, make, getState }) {
   $('sync-target-more').onclick = () => run($('sync-target-more'), () => loadTarget(targetHistory, true));
   $('sync-target-close').onclick = () => $('sync-target-dialog').close();
   $('sync-target-use').onclick = () => { if (!targetHistory.length || targetBusy) return; target = targetHistory.at(-1); $('sync-target').textContent = targetHistory.map(entry => entry.name).join(' / ') + ' / 本规则专用目录'; $('sync-target-dialog').close(); };
+  function refreshProgress(rules) {
+    const byId = new Map(rules.map(rule => [rule.id, rule]));
+    for (const card of $('sync-rules').children) {
+      const rule = byId.get(card.dataset.syncId); if (!rule) continue;
+      const schedule = rule.schedule.kind === 'daily' ? `每天 ${rule.schedule.times.join('、')}` : `每 ${rule.schedule.minutes} 分钟`;
+      setText(card.querySelector('.sync-rule-details'), `${schedule} · 已管理 ${rule.managedFiles} 个文件 · ${rule.deleteRemoved ? '同步删除已开启' : '保留本地已删除的云端文件'}`);
+      setText(card.querySelector('.sync-rule-next'), `上次执行：${date(rule.lastRun)}　下次：${rule.enabled ? date(rule.nextRun) : '已停用'}`);
+      const stats = rule.stats;
+      setText(card.querySelector('.sync-result'), stats ? `新增 ${stats.added} · 更新 ${stats.updated} · 跳过 ${stats.skipped} · 删除 ${stats.deleted} · 失败 ${stats.failed}${rule.cleanupCount ? ` · 待清理旧版 ${rule.cleanupCount}` : ''}` : '等待首次比对');
+      const current = card.querySelector('.sync-current-file');
+      setText(current, rule.currentFile ? `${states[rule.state]}：${rule.currentFile}` : rule.error || (rule.lastSuccess ? `最近成功：${date(rule.lastSuccess)}` : '首次按计划同步，或点击立即同步'));
+      current.classList.toggle('sync-error', Boolean(rule.error));
+      if (!rule.progress) continue;
+      const values = syncProgress(rule), bar = card.querySelector('progress');
+      if (values.known) { if (bar.value !== values.ratio) bar.value = values.ratio; } else if (bar.hasAttribute('value')) bar.removeAttribute('value');
+      setText(card.querySelector('.transfer-progress>span'), values.percent);
+      const size = card.querySelector('.sync-progress-size');
+      setText(size, `已处理 / 总大小：${values.bytes}`);
+      const title = `整轮源文件大小，包含跳过的不变文件；本轮需上传 ${roundedBytes(rule.progress.uploadBytes)}，跳过 ${roundedBytes(rule.progress.skippedBytes)}`;
+      if (size.title !== title) size.title = title;
+      setText(card.querySelector('.sync-progress-detail'), values.detail);
+      card.querySelectorAll('.transfer-metrics strong').forEach((node, i) => setText(node, [values.speed, values.elapsed, values.remaining][i]));
+    }
+  }
   function render(state) {
     const owner = state.account?.uid;
-    if (lastOwner !== owner) { lastOwner = owner; reset(); $('sync-target-dialog').close(); $('sync-confirm-dialog').close('cancel'); targetRequest++; }
-    controls(); $('sync-warning').textContent = state.sync?.warning || ''; $('sync-warning').hidden = !state.sync?.warning;
-    const rules = state.sync?.rules || [], key = JSON.stringify(rules); if (key === lastKey) return; lastKey = key;
-    $('sync-count').textContent = `${rules.length} 条`; $('sync-rules').replaceChildren();
-    if (!rules.length) $('sync-rules').append(make('p', 'empty-state', owner ? '还没有规则，选择路径并保存后开始' : '登录后创建第一条同步规则'));
-    for (const rule of rules) {
+    if (lastOwner !== owner) { lastOwner = owner; reset(); $('sync-target-dialog').close(); $('sync-confirm-dialog').close('cancel'); targetRequest++; cards.clear(); $('sync-rules').replaceChildren(); }
+    controls(); setText($('sync-warning'), state.sync?.warning || ''); $('sync-warning').hidden = !state.sync?.warning;
+    if ($('sync-panel').hidden || document.hidden) return;
+    const rules = state.sync?.rules || [], ids = new Set(rules.map(rule => rule.id));
+    for (const [id, item] of cards) if (!ids.has(id)) { item.root.remove(); cards.delete(id); }
+    setText($('sync-count'), `${rules.length} 条`);
+    if (rules.length) $('sync-rules').querySelector('.empty-state')?.remove();
+    else if (!$('sync-rules').querySelector('.empty-state')) $('sync-rules').append(make('p', 'empty-state', owner ? '还没有规则，选择路径并保存后开始' : '登录后创建第一条同步规则'));
+    for (const [index, rule] of rules.entries()) {
+      const key = JSON.stringify([rule.name, rule.sourcePath, rule.parentId, rule.schedule, rule.enabled, rule.deleteRemoved, rule.state, Boolean(rule.progress)]);
+      const old = cards.get(rule.id);
+      if (old?.key === key) { if ($('sync-rules').children[index] !== old.root) $('sync-rules').insertBefore(old.root, $('sync-rules').children[index] || null); continue; }
+      old?.root.remove();
+      const currentRule = () => getState().sync?.rules.find(item => item.id === rule.id);
       const card = make('article', 'sync-rule'); card.dataset.syncId = rule.id;
       const heading = make('div', 'sync-rule-heading'), title = make('h3', '', rule.name), status = make('span', 'sync-badge', !rule.enabled && !['scanning', 'uploading', 'cleaning'].includes(rule.state) ? '已停用' : states[rule.state] || rule.state); heading.append(title, status);
       const source = make('p', 'sync-rule-path', rule.sourcePath); source.title = rule.sourcePath;
       const schedule = rule.schedule.kind === 'daily' ? `每天 ${rule.schedule.times.join('、')}` : `每 ${rule.schedule.minutes} 分钟`;
-      const details = make('p', 'muted small', `${schedule} · 已管理 ${rule.managedFiles} 个文件 · ${rule.deleteRemoved ? '同步删除已开启' : '保留本地已删除的云端文件'}`);
-      const next = make('p', 'muted small', `上次执行：${date(rule.lastRun)}　下次：${rule.enabled ? date(rule.nextRun) : '已停用'}`);
-      const progress = make('p', 'small', rule.currentFile ? `${states[rule.state]}：${rule.currentFile}` : rule.error || (rule.lastSuccess ? `最近成功：${date(rule.lastSuccess)}` : '首次按计划同步，或点击立即同步'));
+      const details = make('p', 'muted small sync-rule-details', `${schedule} · 已管理 ${rule.managedFiles} 个文件 · ${rule.deleteRemoved ? '同步删除已开启' : '保留本地已删除的云端文件'}`);
+      const next = make('p', 'muted small sync-rule-next', `上次执行：${date(rule.lastRun)}　下次：${rule.enabled ? date(rule.nextRun) : '已停用'}`);
+      const progress = make('p', 'small sync-current-file', rule.currentFile ? `${states[rule.state]}：${rule.currentFile}` : rule.error || (rule.lastSuccess ? `最近成功：${date(rule.lastSuccess)}` : '首次按计划同步，或点击立即同步'));
       progress.classList.toggle('sync-error', Boolean(rule.error));
       const stats = rule.stats, result = make('p', 'sync-result small', stats ? `新增 ${stats.added} · 更新 ${stats.updated} · 跳过 ${stats.skipped} · 删除 ${stats.deleted} · 失败 ${stats.failed}${rule.cleanupCount ? ` · 待清理旧版 ${rule.cleanupCount}` : ''}` : '等待首次比对');
-      const buttons = make('div', 'sync-rule-actions'), active = ['scanning', 'uploading', 'cleaning'].includes(rule.state);
+      const buttons = make('div', 'sync-rule-actions'), active = syncActive(rule);
       const add = (label, action, disabled = false) => { const button = make('button', 'secondary compact', label); button.disabled = disabled; button.onclick = () => run(button, action); buttons.append(button); };
       add(rule.state === 'queued' ? '等待空闲…' : '立即同步', () => api.call('runSync', { id: rule.id }), active || rule.state === 'queued');
       add(active || rule.enabled ? '暂停规则' : '启用规则', () => api.call('toggleSync', { id: rule.id, enabled: !active && !rule.enabled }));
-      add('编辑', () => edit(rule), active);
+      add('编辑', () => { const latest = currentRule(); if (latest) edit(latest); }, active);
       add('移除', async () => { if (await confirm('移除同步规则？', `移除“${rule.name}”并停止后续同步，已上传的云端内容保留。`)) { await api.call('removeSync', { id: rule.id }); if (editing === rule.id) reset(); } }, active);
-      card.append(heading, source, details, next, progress, result, buttons); $('sync-rules').append(card);
+      card.append(heading, source, details, next, progress);
+      if (rule.progress) {
+        const values = syncProgress(rule), group = make('div', 'sync-progress'), row = make('div', 'transfer-progress'), bar = make('progress'), percent = make('span', '', values.percent);
+        bar.max = 1; if (values.known) bar.value = values.ratio; bar.setAttribute('aria-label', `${rule.name}整轮同步进度`); row.append(bar, percent);
+        const size = make('p', 'sync-progress-size small', `已处理 / 总大小：${values.bytes}`); size.title = `整轮源文件大小，包含跳过的不变文件；本轮需上传 ${roundedBytes(rule.progress.uploadBytes)}，跳过 ${roundedBytes(rule.progress.skippedBytes)}`;
+        const metrics = make('div', 'transfer-metrics');
+        for (const [label, value] of [['上传速度', values.speed], ['已用时间', values.elapsed], ['预计剩余', values.remaining]]) { const cell = make('div'); cell.append(make('small', '', label), make('strong', '', value)); metrics.append(cell); }
+        group.append(row, size, make('p', 'small muted sync-progress-detail', values.detail), metrics); card.append(group);
+      }
+      card.append(result, buttons); $('sync-rules').insertBefore(card, $('sync-rules').children[index] || null); cards.set(rule.id, { key, root: card });
     }
+    refreshProgress(rules);
   }
   scheduleFields(); return { render };
 }

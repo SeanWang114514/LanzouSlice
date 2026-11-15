@@ -61,16 +61,24 @@ export class FolderRecognition {
         while (next < folders.length) {
           signal?.throwIfAborted();
           const { id, name } = folders[next++];
-          let result = force ? null : this.get(ownerUid, id, name);
+          const cached = this.get(ownerUid, id, name);
+          let result = force ? null : cached;
           if (!result || result.stale) {
+            const deadline = AbortSignal.timeout(12_000);
+            const readSignal = AbortSignal.any([signal, deadline]);
             try {
-              result = { ...await this.identify(String(id), signal), id: String(id) };
-              signal?.throwIfAborted();
+              result = { ...await this.identify(String(id), readSignal), id: String(id) };
+              readSignal.throwIfAborted();
               this.forget(ownerUid, id); this.remember(ownerUid, id, result, name);
             } catch (error) {
               if (signal.aborted || error.code === 'AUTH_EXPIRED') { controller.abort(error); throw error; }
-              this.forget(ownerUid, id);
-              result = { id: String(id), status: 'unavailable', message: error.message };
+              const temporary = deadline.aborted || ['NETWORK', 'RATE_LIMIT', 'VERIFY_REQUIRED'].includes(error.code) || ['TypeError', 'TimeoutError'].includes(error.name);
+              const message = deadline.aborted ? '目录识别超时，可刷新重试' : error.message;
+              if (temporary && cached?.status === 'preview') result = { ...cached, stale: true, message };
+              else {
+                this.forget(ownerUid, id);
+                result = { id: String(id), status: 'unavailable', message };
+              }
             }
           }
           signal?.throwIfAborted();

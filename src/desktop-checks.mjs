@@ -5,11 +5,11 @@ import { writeFile, readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { checkFileManagement } from './desktop-management-checks.mjs';
 import { checkBatchDownloads } from './desktop-batch-checks.mjs';
-import { shell } from 'electron';
+import { shell, dialog } from 'electron';
 
-export async function checkReadAndDrop(window, { firstFile, secondFile, outputDir, fixtureOrigin }) {
+export async function checkReadAndDrop(window, { firstFile, secondFile, outputDir, fixtureOrigin, recognition }) {
   const web = window.webContents;
-  const evaluate = code => web.executeJavaScript(code);
+  const evaluate = code => web.executeJavaScript(code).catch(error => { throw new Error(`${error.message}\n界面验收表达式：${code.slice(0, 600)}`); });
   async function until(expression, timeout = 12000) {
     const deadline = Date.now() + timeout;
     while (!await evaluate(expression)) {
@@ -33,6 +33,20 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     }
   }
   const layoutChecks = [];
+  async function checkStickyTitlebar() {
+    const originalSize = window.getContentSize();
+    try {
+      await evaluate(`document.querySelector('#tab-settings').click();const probe=document.createElement('div');probe.id='smoke-scroll-space';probe.style.height='2000px';document.querySelector('.workspace').append(probe)`);
+      for (const [width, height] of [[940,700],[1260,900],[1920,1080]]) {
+        window.setContentSize(width, height);
+        await evaluate(`window.scrollTo(0,260);new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))`);
+        const metrics = await evaluate(`(()=>{const bar=document.querySelector('.topbar'),rect=bar.getBoundingClientRect(),account=document.querySelector('.account-panel').getBoundingClientRect();return {scrollY,top:rect.top,bottom:rect.bottom,width:rect.width,scrollWidth:document.documentElement.scrollWidth,accountTop:account.top,drag:getComputedStyle(bar).webkitAppRegion,buttons:[...document.querySelectorAll('.window-button')].map(button=>{const r=button.getBoundingClientRect();return {id:button.id,visible:r.top>=rect.top&&r.bottom<=rect.bottom,hit:button.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)),drag:getComputedStyle(button).webkitAppRegion}})}})()`);
+        assert.ok(metrics.scrollY >= 260); assert.equal(metrics.top, 0); assert.equal(metrics.bottom, 64); assert.ok(metrics.scrollWidth <= width); assert.ok(metrics.accountTop >= metrics.bottom); assert.equal(metrics.drag, 'drag');
+        assert.ok(metrics.buttons.length === 3 && metrics.buttons.every(button => button.visible && button.hit && button.drag === 'no-drag'));
+        layoutChecks.push({name:`sticky-titlebar-${width}x${height}`,...metrics}); await capture(`sticky-titlebar-${width}x${height}.png`);
+      }
+    } finally { await evaluate(`document.querySelector('#smoke-scroll-space')?.remove();document.querySelector('#tab-upload').click();window.scrollTo(0,0)`); window.setContentSize(...originalSize); }
+  }
   async function checkLayout(withSummary = false, prefix = withSummary ? 'download-ready' : 'directory') {
     const originalSize = window.getContentSize();
     try {
@@ -64,6 +78,10 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
       for (const [width,height] of [[940,700],[1260,900],[1920,1080]]) {
         window.setContentSize(width,height);
         await evaluate(`document.querySelector('#notice').hidden=true;window.scrollTo(0,0);document.fonts.ready.then(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))))`);
+        if (name === 'settings') {
+          await evaluate(`document.querySelector(${JSON.stringify(actionSelector)}).scrollIntoView({block:'center'});new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))`);
+          assert.equal(await evaluate(`(()=>{const node=document.querySelector(${JSON.stringify(actionSelector)}),r=node.getBoundingClientRect();return node.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`), true, '设置页滚动后按钮必须可点击');
+        }
         const metrics = await evaluate(`(()=>{const action=document.querySelector(${JSON.stringify(actionSelector)}).getBoundingClientRect(),side=document.querySelector('.account-panel').getBoundingClientRect();return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,actionBottom:action.bottom,actionRight:action.right,sideBottom:side.bottom}})()`);
         assert.ok(metrics.scrollWidth <= metrics.width, `${name} 页面不能横向溢出`);
         assert.ok(metrics.actionBottom <= metrics.height && metrics.actionRight <= metrics.width, `${name} 操作必须在窗口内`);
@@ -149,16 +167,18 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     shell.showItemInFolder = filename => { folderCalls.push(['reveal', filename]); };
     shell.openPath = async directory => { folderCalls.push(['open', directory]); return ''; };
     await web.debugger.sendCommand('DOM.enable');
+    await checkStickyTitlebar();
     const theme = await checkNeumorphism();
     const iconChecks = await evaluate(`(()=>{
       const hosts=[...document.querySelectorAll('[data-icon]')],logo=document.querySelector('.logo');
       const details=hosts.map(host=>{const svg=host.querySelector('svg'),style=svg&&getComputedStyle(svg);return {id:host.id,name:host.dataset.icon,vector:!!svg,hidden:svg?.getAttribute('aria-hidden')==='true',nonFocusable:svg?.getAttribute('focusable')==='false',stroke:style?.stroke,fill:style?.fill,width:style?.width,height:style?.height,label:host.getAttribute('aria-label')}});
       return {static:details,logoLoaded:logo.complete&&logo.naturalWidth>0,quietSurfaces:['.logo','.account-icon','.file-icon'].every(selector=>getComputedStyle(document.querySelector(selector)).boxShadow==='none')};
     })()`);
-    assert.equal(iconChecks.static.length,8);
+    assert.equal(iconChecks.static.length,9);
     assert.ok(iconChecks.static.every(item=>item.vector&&item.hidden&&item.nonFocusable&&item.fill==='none'&&item.stroke!=='none'));
     assert.ok(iconChecks.logoLoaded&&iconChecks.quietSurfaces);
     assert.equal(iconChecks.static.find(item=>item.id==='floating-close').label,'隐藏传输浮窗');
+    assert.equal(iconChecks.static.find(item=>item.id==='sync-floating-close').label,'隐藏同步浮窗');
     assert.deepEqual(iconChecks.static.filter(item=>item.id.startsWith('window-')).map(item=>item.label),['最小化','最大化','关闭']);
     const { root } = await web.debugger.sendCommand('DOM.getDocument');
     const { nodeId } = await web.debugger.sendCommand('DOM.querySelector', { nodeId: root.nodeId, selector: '#smoke-files' });
@@ -173,11 +193,34 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     assert.equal(await evaluate(`!document.querySelector('#source-size').hidden&&document.querySelector('#source-size').textContent.includes('KiB')&&document.querySelector('#choose-source').classList.contains('has-file')`), true);
 
     await drop([firstFile, secondFile]);
-    await until(`document.querySelector('#notice').textContent.includes('每次请拖入一个文件')`);
-    assert.equal(await evaluate(`document.querySelector('#source-path').textContent`), firstFile);
+    await until(`document.querySelector('#source-name').textContent==='已选择 2 个文件'&&!document.querySelector('#choose-source').disabled`);
+    assert.equal(await evaluate(`document.querySelector('#source-path').textContent`), [firstFile, secondFile].join('；'));
+    assert.equal(await evaluate(`window.lanzou.call('state').then(state=>state.tasks.length)`), 0);
+    await evaluate(`{const data=new DataTransfer();for(let i=0;i<201;i++)data.items.add(document.querySelector('#smoke-files').files[0]);document.querySelector('#choose-source').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:data}));}`);
+    await until(`document.querySelector('#notice').textContent.includes('1–200')`);
+    assert.equal(await evaluate(`document.querySelector('#source-name').textContent`), '已选择 2 个文件');
     await evaluate(`{const data=new DataTransfer();data.items.add(new File(['virtual'],'virtual.bin'));document.querySelector('#choose-source').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:data}));}`);
     await until(`document.querySelector('#notice').textContent.includes('实际文件')`);
+    await evaluate(`{const data=new DataTransfer();data.items.add(document.querySelector('#smoke-files').files[0]);data.items.add(new File(['virtual'],'virtual.bin'));document.querySelector('#choose-source').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:data}));}`);
+    await until(`document.querySelector('#notice').textContent.includes('本批未加入队列')`);
+    assert.equal(await evaluate(`document.querySelector('#source-name').textContent`), '已选择 2 个文件');
     assert.equal(await evaluate(`window.lanzou.call('selectSource',{path:${JSON.stringify(path.dirname(firstFile))}}).then(()=>false,error=>error.message.includes('文件夹'))`), true);
+
+    assert.equal(await evaluate(`document.querySelectorAll('#source-list .source-item').length`), 2);
+    assert.equal(await evaluate(`document.querySelector('#remove-sources').disabled`), true);
+    await evaluate(`document.querySelector('#source-list input').click()`);
+    assert.equal(await evaluate(`document.querySelector('#source-select-all').indeterminate`), true);
+    await evaluate(`document.querySelector('#remove-sources').click()`);
+    assert.equal(await evaluate(`document.querySelector('#source-path').textContent`), secondFile);
+    assert.equal(await evaluate(`document.querySelector('#source-size').textContent`), `${(await readFile(secondFile)).length} B`);
+    assert.equal(await evaluate(`document.querySelector('#remove-sources').disabled&&document.querySelectorAll('#source-list input:checked').length===0`), true);
+    await evaluate(`document.querySelector('#source-select-all').click();document.querySelector('#remove-sources').click()`);
+    assert.equal(await evaluate(`document.querySelector('#source-selection').hidden&&document.querySelector('#source-size').hidden&&document.querySelector('#start-upload').disabled&&!document.querySelector('#choose-source').classList.contains('has-file')`), true);
+    assert.deepEqual(await readFile(firstFile), Buffer.alloc(32000, 17));
+    assert.equal((await readFile(secondFile)).toString(), 'second file');
+    await drop([firstFile, secondFile]);
+    await until(`document.querySelectorAll('#source-list .source-item').length===2&&!document.querySelector('#choose-source').disabled`);
+    assert.equal(await evaluate(`document.querySelector('#source-select-all').checked||document.querySelector('#source-select-all').indeterminate`), false);
 
     await evaluate(`window.lanzou.call('login',{account:'test',password:'only-for-fixture',remember:false})`);
     await until(`document.querySelector('#account-status').classList.contains('connected')`);
@@ -217,7 +260,10 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     await until(`document.querySelector('#folder-path').textContent.includes('可进入目录')`);
     await until(`document.querySelector('#folder-list').textContent.includes('普通文件夹')`);
     assert.equal(await evaluate(`document.querySelector('#folder-list').textContent.includes('普通文档.txt')&&document.querySelectorAll('.slice-folder').length===0&&document.querySelectorAll('[data-download-slice]').length===0`), true);
-    await enter('普通子目录');
+    // Checkbox and modified double-clicks must not navigate; the folder name must.
+    await evaluate(`{const row=[...document.querySelectorAll('.folder-row')].find(row=>row.textContent.includes('普通子目录'));row.querySelector('input').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));row.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,ctrlKey:true}));}`);
+    assert.equal(await evaluate(`document.querySelector('#folder-path').textContent.endsWith('可进入目录')`), true);
+    await evaluate(`{const row=[...document.querySelectorAll('.folder-row')].find(row=>row.textContent.includes('普通子目录'));row.querySelector('.file-name-text').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));}`);
     await until(`document.querySelector('#folder-path').textContent.includes('普通子目录')&&document.querySelector('#folder-list').textContent.includes('此目录为空')`);
     await evaluate(`document.querySelector('#folder-up').click()`);
     await until(`document.querySelector('#folder-path').textContent.endsWith('可进入目录')&&!document.querySelector('#refresh-folders').disabled`);
@@ -233,9 +279,13 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     await evaluate(`document.querySelector('#tab-upload').click()`);
     await drop([firstFile]);
     await until(`(async()=>{const s=await window.lanzou.call('state');return s.tasks.some(task=>task.type==='upload'&&task.state==='running')})()`);
+    await until(`!document.querySelector('#choose-source').disabled`);
     await drop([secondFile]);
     await until(`document.querySelector('#source-path').textContent===${JSON.stringify(secondFile)}`);
-    await until(`document.querySelector('#notice').textContent.includes('当前任务')`);
+    await until(`document.querySelector('#notice').textContent.includes('传输队列')`);
+    await until(`window.lanzou.call('state').then(state=>state.tasks.some(task=>task.originalName===${JSON.stringify(path.basename(secondFile))}&&task.state==='queued'))`);
+    await until(`!document.querySelector('#start-upload').disabled`);
+    assert.equal(await evaluate(`document.querySelector('#start-upload').disabled`), false);
     await until(`!document.querySelector('#floating-transfer').hidden`);
     assert.match(await evaluate(`document.querySelector('#floating-speed').textContent`), /^\d+\.\d{2} (?:B|KiB|MiB|GiB|TiB)\/s$/);
     await checkFolderClick(`document.querySelector('#floating-folder')`, ['reveal', firstFile]);
@@ -246,16 +296,24 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     assert.equal(await evaluate(`document.querySelector('#floating-transfer').getBoundingClientRect().height`), 48);
     await evaluate(`document.querySelector('#floating-toggle').click();document.querySelector('#floating-open').click()`);
     await until(`!document.querySelector('#transfers-panel').hidden`);
-    await checkFolderClick(`[...document.querySelectorAll('#tasks .task-buttons button')].find(button=>button.textContent==='打开所在文件夹')`, ['reveal', firstFile]);
+    await checkFolderClick(`[...[...document.querySelectorAll('#tasks .task')].find(row=>row.textContent.includes(${JSON.stringify(path.basename(firstFile))})).querySelectorAll('.task-buttons button')].find(button=>button.textContent==='打开所在文件夹')`, ['reveal', firstFile]);
     await evaluate(`document.querySelector('#pause-all').click()`);
     await until(`window.lanzou.call('state').then(state=>state.tasks[0].state==='paused')`);
     await until(`document.querySelector('#floating-action').textContent==='继续'`);
     assert.equal(await evaluate(`document.querySelector('#floating-speed').textContent`), '0.00 B/s');
     await checkOtherView('transfer-manager-paused', '#pause-all');
     await evaluate(`document.querySelector('#floating-action').click()`);
+    await until(`window.lanzou.call('state').then(state=>state.tasks.some(task=>task.state==='running'))`);
+    const queuedUpload = await evaluate(`window.lanzou.call('state').then(state=>state.tasks.find(task=>task.originalName===${JSON.stringify(path.basename(secondFile))}).id)`);
+    await evaluate(`window.lanzou.call('resume',{id:${JSON.stringify(queuedUpload)}})`);
     // Keep the already-loaded browser open during completion: a late state event must refresh it.
     await evaluate(`document.querySelector('#tab-download').click()`);
-    await until(`(async()=>{const s=await window.lanzou.call('state');return s.tasks.some(task=>task.type==='upload'&&task.state==='completed')})()`);
+    await until(`window.lanzou.call('state').then(state=>state.tasks.length===2&&state.tasks.every(task=>task.state==='completed'))`);
+    const queuedFolder = await evaluate(`window.lanzou.call('state').then(state=>state.tasks.find(task=>task.id===${JSON.stringify(queuedUpload)}).folderId)`);
+    await until(`window.lanzou.call('clearHistory',{id:${JSON.stringify(queuedUpload)}}).then(result=>result.removed===1)`);
+    await evaluate(`window.lanzou.call('manageCloud',{action:'delete',id:${JSON.stringify(queuedFolder)},parentId:'-1',isFolder:true})`);
+    await evaluate(`document.querySelector('#refresh-folders').click()`);
+    await until(`!document.querySelector('#refresh-folders').disabled&&!document.querySelector('.folder-row[data-entry-id="${queuedFolder}"]')`);
     const state = await evaluate(`window.lanzou.call('state')`);
     assert.equal(state.tasks.length, 1); assert.equal(state.tasks[0].originalName, path.basename(firstFile));
     assert.equal(state.tasks[0].concurrency, 3); assert.equal(state.tasks[0].totalParts, 5);
@@ -287,13 +345,46 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     await until(`window.__recognitionResults.some(result=>result.id==='888')`);
     assert.equal(await evaluate(`window.__recognitionPending`), true, '快目录应先于慢目录整批结束显示');
     await evaluate(`window.__recognitionScan.then(()=>{window.__recognitionOff();})`);
+    const sliceRow = `.folder-row[data-entry-id="${folderId}"][data-entry-kind="folder"]`;
+    const beforeIds = await evaluate(`[...document.querySelectorAll('.folder-row')].map(row=>row.dataset.entryKind+':'+row.dataset.entryId).sort()`);
+    await evaluate(`window.__previewLost=false;window.__previewWatch=new MutationObserver(()=>{const row=document.querySelector(${JSON.stringify(sliceRow)});if(!row?.classList.contains('slice-folder')||row.querySelector('.slice-name')?.textContent!==${JSON.stringify(path.basename(firstFile))})window.__previewLost=true;});window.__previewWatch.observe(document.querySelector('#folder-list'),{childList:true,subtree:true});`);
+    const refreshRecognition = async () => {
+      await evaluate(`document.querySelector('#refresh-folders').click()`);
+      await until(`!document.querySelector('#refresh-folders').disabled&&!document.querySelector('#recognition-status').textContent.includes('待识别')`);
+    };
+    await refreshRecognition();
+    assert.equal(countReads(await (await fetch(`${fixtureOrigin}/fixture/stats`)).json()), beforeCache, '近期识别结果刷新时不重复读取子目录');
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('.folder-row')].map(row=>row.dataset.entryKind+':'+row.dataset.entryId).sort()`), beforeIds);
+    assert.equal(await evaluate(`window.__previewLost`), false);
+    // Expire only this isolated fixture's hint; the production clock and IPC stay unchanged.
+    recognition.entries.get(`123:${folderId}`).checkedAt = Date.now() - 300_001;
+    await fetch(`${fixtureOrigin}/fixture/control?recognitionFolder=${folderId}&recognitionDelay=500`);
     await evaluate(`document.querySelector('#refresh-folders').click()`);
-    await until(`document.querySelector('.slice-folder .slice-name')!==null&&!document.querySelector('.slice-folder .slice-caption').textContent.includes('缓存预览')`);
+    await until(`document.querySelector('#recognition-status').textContent.includes('待识别')`);
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(sliceRow)})?.classList.contains('slice-folder')`), true);
     await until(`!document.querySelector('#recognition-status').textContent.includes('待识别')`);
-    assert.ok(countReads(await (await fetch(`${fixtureOrigin}/fixture/stats`)).json()) > beforeCache, '刷新目录必须绕过旧识别缓存');
+    assert.ok(countReads(await (await fetch(`${fixtureOrigin}/fixture/stats`)).json()) > beforeCache);
+    recognition.entries.get(`123:${folderId}`).checkedAt = Date.now() - 300_001;
+    await fetch(`${fixtureOrigin}/fixture/control?recognitionDelay=0&recognitionFail=1`);
+    await refreshRecognition();
+    await until(`document.querySelector(${JSON.stringify(sliceRow+' .slice-caption')})?.textContent.includes('更新未完成')`);
+    assert.equal(await evaluate(`window.__previewLost`), false, '慢请求或临时失败不能使已有原名消失');
+    await fetch(`${fixtureOrigin}/fixture/control?recognitionFail=0`);
+    await refreshRecognition();
+    await until(`document.querySelector(${JSON.stringify(sliceRow+' .slice-caption')})&&!document.querySelector(${JSON.stringify(sliceRow+' .slice-caption')}).textContent.includes('更新未完成')`);
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('.folder-row')].map(row=>row.dataset.entryKind+':'+row.dataset.entryId).sort()`), beforeIds);
+    await evaluate(`window.__previewWatch.disconnect()`);
+    recognition.entries.get(`123:${folderId}`).checkedAt = Date.now() - 300_001;
+    await fetch(`${fixtureOrigin}/fixture/control?recognitionEmpty=1`);
+    await refreshRecognition();
+    await until(`document.querySelector(${JSON.stringify(sliceRow+' .slice-caption')})?.textContent==='普通文件夹'`);
+    recognition.forget('123', folderId);
+    await fetch(`${fixtureOrigin}/fixture/control?recognitionEmpty=0`);
+    await refreshRecognition();
+    await until(`document.querySelector(${JSON.stringify(sliceRow)})?.classList.contains('slice-folder')`);
     const normal = await evaluate(`(()=>{const row=[...document.querySelectorAll('.folder-row')].find(row=>row.querySelector('.file-name-text').textContent==='可进入目录');return {folder:!!row.querySelector('.entry-icon.folder'),enter:row.querySelector('button').textContent,downloads:row.querySelectorAll('[data-download-slice]').length,caption:row.querySelector('.slice-caption')?.textContent}})()`);
     assert.deepEqual(normal, {folder:true,enter:'进入',downloads:0,caption:'普通文件夹'});
-    await writeFile(path.join(outputDir,'recognition-checks.json'),JSON.stringify({instantNavigation,warmChildRequests:0,uploadedPreviewSeeded:true,streamedBeforeSlowFolder:true,forceRefresh:true,ordinaryFolder:normal},null,2));
+    await writeFile(path.join(outputDir,'recognition-checks.json'),JSON.stringify({instantNavigation,warmChildRequests:0,uploadedPreviewSeeded:true,streamedBeforeSlowFolder:true,refreshRetainsPreview:true,warmRefreshChildRequests:0,staleRevalidated:true,temporaryFailureRetainsPreview:true,confirmedOrdinaryClearsPreview:true,refreshPreservesEntryIds:true,ordinaryFolder:normal},null,2));
     await evaluate(`document.querySelector('#notice').hidden=true`);
     await capture('recognized-original-name.png');
     await checkLayout(false, 'smart-directory');
@@ -416,11 +507,68 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     const batch = await checkBatchDownloads(window, { evaluate, until, capture, firstFile, outputDir, fixtureOrigin });
     layoutChecks.push(...batch.layouts);
     const management = await checkFileManagement(window, { evaluate, until, capture, fixtureOrigin, firstFile, checkFolderClick, outputDir });
-    Object.assign(management.features, theme);
+    Object.assign(management.features, theme, { stickyTitlebar: true });
     assert.equal(folderClicks.length, 8);
     await writeFile(path.join(outputDir,'folder-opening-checks.json'), JSON.stringify({ shellCallsIntercepted: true, realExplorerWindowsOpened: false, clicks: folderClicks }, null, 2));
     layoutChecks.push(...management.layouts);
+    const uploadPaths = ['批量排队一.txt', '批量排队二 &+.txt', '追加排队三.txt', '追加排队四.txt'].map(name => path.join(path.dirname(firstFile), name));
+    for (const file of uploadPaths) await writeFile(file, `batch fixture ${file}`);
+    const excludedPaths = ['移除的文件一.txt', '移除的文件二 &+.txt', '移除的文件三.txt', `移除的长文件名-${'安装包 &+'.repeat(12)}.txt`].map(name => path.join(path.dirname(firstFile), name));
+    for (const file of excludedPaths) await writeFile(file, `excluded fixture ${file}`);
+    await evaluate(`document.querySelector('#tab-upload').click()`);
+    const nativeDialog = dialog.showOpenDialog;
+    let pickerOptions;
+    try {
+      dialog.showOpenDialog = async (_window, options) => { pickerOptions = options; return { canceled: false, filePaths: [...uploadPaths.slice(0, 2), ...excludedPaths] }; };
+      await evaluate(`document.querySelector('#choose-source').click()`);
+      await until(`document.querySelectorAll('#source-list .source-item').length===6&&!document.querySelector('#choose-source').disabled`);
+      assert.ok(pickerOptions.properties.includes('multiSelections'));
+      assert.equal(await evaluate(`document.querySelector('#source-list').scrollHeight>document.querySelector('#source-list').clientHeight`), true);
+      await checkOtherView('upload-selection', '#remove-sources');
+      await evaluate(`[...document.querySelectorAll('#source-list input')].slice(2).forEach(box=>box.click())`);
+      assert.equal(await evaluate(`document.querySelector('#source-selection-count').textContent`), '待移除 4 / 6 项');
+      await evaluate(`document.querySelector('#remove-sources').click()`);
+      assert.equal(await evaluate(`document.querySelector('#source-path').textContent`), uploadPaths.slice(0, 2).join('；'));
+      assert.equal(await evaluate(`document.querySelector('#source-size').textContent`), `合计 ${(await Promise.all(uploadPaths.slice(0, 2).map(file => readFile(file)))).reduce((sum, data) => sum + data.length, 0)} B`);
+      await evaluate(`document.querySelector('#source-list input').click()`);
+      let finishDialog;
+      dialog.showOpenDialog = () => new Promise(resolve => { finishDialog = resolve; });
+      await evaluate(`document.querySelector('#choose-source').click()`);
+      try {
+        await until(`document.querySelector('#source-selection').disabled`);
+        assert.equal(await evaluate(`document.querySelector('#source-list input').matches(':disabled')&&document.querySelector('#remove-sources').matches(':disabled')`), true);
+        await evaluate(`document.querySelector('#remove-sources').click()`);
+        assert.equal(await evaluate(`document.querySelectorAll('#source-list .source-item').length`), 2);
+      } finally { finishDialog?.({ canceled: true, filePaths: [] }); }
+      await until(`!document.querySelector('#choose-source').disabled`);
+      assert.equal(await evaluate(`document.querySelector('#source-path').textContent`), uploadPaths.slice(0, 2).join('；'));
+      assert.equal(await evaluate(`document.querySelector('#source-list input').checked`), true, '取消文件对话框应保留移除选择');
+      await evaluate(`document.querySelector('#source-list input').click()`);
+    } finally { dialog.showOpenDialog = nativeDialog; }
+    await checkOtherView('upload-batch', '#start-upload');
+    await evaluate(`window.__sourceRowsChanged=0;window.__sourceRow=document.querySelector('#source-list .source-item');window.__sourceObserver=new MutationObserver(records=>window.__sourceRowsChanged+=records.length);window.__sourceObserver.observe(document.querySelector('#source-list'),{childList:true,subtree:true,characterData:true});document.querySelector('#start-upload').click();if(!document.querySelector('#source-selection').disabled)throw new Error('准备上传时必须锁定选择列表');`);
+    await until(`window.lanzou.call('state').then(state=>state.tasks.some(task=>task.originalName===${JSON.stringify(path.basename(uploadPaths[0]))}&&task.state==='running'))`);
+    await until(`!document.querySelector('#choose-source').disabled`);
+    assert.equal(await evaluate(`window.__sourceRow===document.querySelector('#source-list .source-item')&&window.__sourceRowsChanged===0`), true, '上传状态更新不能重建文件选择列表');
+    await evaluate(`window.__sourceObserver.disconnect()`);
+    await drop(uploadPaths.slice(2));
+    await until(`!document.querySelector('#choose-source').disabled&&document.querySelector('#source-name').textContent==='已选择 2 个文件'`);
+    const names = uploadPaths.map(file => path.basename(file));
+    const uploads = await evaluate(`window.lanzou.call('state').then(state=>state.tasks.filter(task=>${JSON.stringify(names)}.includes(task.originalName)))`);
+    assert.deepEqual(uploads.map(task => task.originalName), names);
+    assert.equal(uploads[0].state, 'running'); assert.ok(uploads.slice(1).every(task => task.state === 'queued'));
+    await until(`window.lanzou.call('state').then(state=>state.tasks.filter(task=>${JSON.stringify(names)}.includes(task.originalName)).every(task=>['completed','failed','paused'].includes(task.state)))`, 30000);
+    const finished = await evaluate(`window.lanzou.call('state').then(state=>state.tasks.filter(task=>${JSON.stringify(names)}.includes(task.originalName)))`);
+    assert.ok(finished.every(task=>task.state==='completed'), JSON.stringify(finished.map(task=>({name:task.originalName,state:task.state,error:task.error}))));
+    assert.deepEqual([...finished].sort((a,b)=>Date.parse(a.lastStoppedAt)-Date.parse(b.lastStoppedAt)).map(task=>task.originalName), names);
+    assert.equal(await evaluate(`document.querySelector('#choose-source').classList.contains('dragging')`), false);
+    const removedNames = excludedPaths.map(file => path.basename(file));
+    assert.equal(await evaluate(`window.lanzou.call('state').then(state=>state.tasks.some(task=>${JSON.stringify(removedNames)}.includes(task.originalName)))`), false, '移除的文件不能建立上传任务');
+    for (const file of excludedPaths) assert.equal((await readFile(file)).toString(), `excluded fixture ${file}`);
+    const sourceSelectionFeatures = { uploadSourceRemoval:true, uploadSourceSelectAllAndEmpty:true, uploadSourceRemovalPreservesOriginals:true, uploadSourceRemovalExcludesUpload:true, uploadSourceRemovalBusyGuard:true, uploadSourceSelectionStable:true };
+    await writeFile(path.join(outputDir,'upload-selection-checks.json'),JSON.stringify({features:sourceSelectionFeatures,singleRemove:true,batchRemoved:excludedPaths.length,sizeRecalculated:true,cancelPickerPreservesSelection:true,progressListMutations:0,layouts:layoutChecks.filter(check=>check.name.startsWith('upload-selection-'))},null,2));
+    await writeFile(path.join(outputDir,'batch-upload-checks.json'),JSON.stringify({files:finished.map(task=>({name:task.originalName,state:task.state,lastStoppedAt:task.lastStoppedAt})),nativePickerMultiple:true,cancelPreservesSelection:true,unloggedSelection:true,batchLimit:200,mixedVirtualRejected:true,busyBatchAppends:true,fifo:true},null,2));
     await writeFile(path.join(outputDir,'layout-checks.json'),JSON.stringify(layoutChecks,null,2));
-    return { ...batch.features, ...management.features, twoDecimalTransferSpeed:true, floatingFolderButton:true, clickableFloatingName:true, uploadSourceLocation:true, slicedDownloadLocation:true, ordinaryDownloadLocation:true, transferManagerFolderButtons:true, nativeFilePath:true, unloggedDropSelectsOnly:true, multipleFilesRejected:true, virtualFileRejected:true, directoryRejected:true, firstPage:true, loadMore:true, endOfList:true, navigationRollback:true, nestedNavigation:true, automaticDropUpload:true, busyDropSelectsOnly:true, manifestRead:true, responsiveFileBrowser:true, alignedFileColumns:true, longNameOverflow:true, paginationKeepsScroll:true, stickyTableHeader:true, compactAccount:true, uploadMetadata:true, expandableTaskDetails:true, responsiveLoginUploadShare:true, automaticOriginalName:true, accountDownloadWithoutShareCode:true, downloadSelection:true, defaultDownloadDirectory:true, dedicatedCacheDirectory:true, cacheCleanup:true, autoCleanToggle:true, clearHistory:true, mergedResultPreserved:true, responsiveSettings:true, uploadConcurrencySetting:true, downloadConcurrencySetting:true, downloadConcurrencyShortcut:true, smartDisplayMode:true, rawDisplayMode:true, displayModeSaved:true, sliceBadgeAndPriority:true, recognitionErrorVisible:true, oneClickDownloadMerge:true, currentSliceCollapsed:true, hashDetailsVisible:true, iframeAliasedSignature:true, fastIndexPreview:true, previewRequiresManifestSelection:true, transferManager:true, typeAndStatusFilters:true, pauseAllAndResumePopup:true, floatingTransferProgress:true, roundedSpeedAndTime:true, fixedFloatingDimensions:true, fixedMetricDimensions:true, allHistoryCleanup:true, singleHistoryRemoval:true, instantDirectoryPreview:true, warmRecognitionZeroReads:true, uploadPreviewPreheated:true, streamedRecognition:true, ordinaryFolderDisplay:true, nestedOrdinaryFolders:true, forceRecognitionRefresh:true };
+    return { ...batch.features, ...management.features, ...sourceSelectionFeatures, twoDecimalTransferSpeed:true, floatingFolderButton:true, clickableFloatingName:true, uploadSourceLocation:true, slicedDownloadLocation:true, ordinaryDownloadLocation:true, transferManagerFolderButtons:true, nativeFilePath:true, unloggedDropSelectsOnly:true, multipleFileSelection:true, batchDropUpload:true, busyBatchDropQueues:true, batchUploadOrder:true, batchUploadSummary:true, batchDropLimit:true, mixedVirtualBatchRejected:true, cancelUploadSelectionPreserved:true, virtualFileRejected:true, directoryRejected:true, firstPage:true, loadMore:true, endOfList:true, navigationRollback:true, nestedNavigation:true, automaticDropUpload:true, busyDropQueuesUpload:true, folderDoubleClick:true, folderDoubleClickControlGuard:true, manifestRead:true, responsiveFileBrowser:true, alignedFileColumns:true, longNameOverflow:true, paginationKeepsScroll:true, stickyTableHeader:true, compactAccount:true, uploadMetadata:true, expandableTaskDetails:true, responsiveLoginUploadShare:true, automaticOriginalName:true, accountDownloadWithoutShareCode:true, downloadSelection:true, defaultDownloadDirectory:true, dedicatedCacheDirectory:true, cacheCleanup:true, autoCleanToggle:true, clearHistory:true, mergedResultPreserved:true, responsiveSettings:true, uploadConcurrencySetting:true, downloadConcurrencySetting:true, downloadConcurrencyShortcut:true, smartDisplayMode:true, rawDisplayMode:true, displayModeSaved:true, sliceBadgeAndPriority:true, recognitionErrorVisible:true, oneClickDownloadMerge:true, currentSliceCollapsed:true, hashDetailsVisible:true, iframeAliasedSignature:true, fastIndexPreview:true, previewRequiresManifestSelection:true, transferManager:true, typeAndStatusFilters:true, pauseAllAndResumePopup:true, floatingTransferProgress:true, roundedSpeedAndTime:true, fixedFloatingDimensions:true, fixedMetricDimensions:true, allHistoryCleanup:true, singleHistoryRemoval:true, instantDirectoryPreview:true, warmRecognitionZeroReads:true, uploadPreviewPreheated:true, streamedRecognition:true, ordinaryFolderDisplay:true, nestedOrdinaryFolders:true, refreshRetainsPreview:true,warmRefreshZeroReads:true,staleRecognitionRefresh:true,temporaryRecognitionFailureRetainsPreview:true,confirmedOrdinaryClearsPreview:true,refreshPreservesEntryIds:true };
   } finally { shell.showItemInFolder = nativeReveal; shell.openPath = nativeOpen; web.debugger.detach(); await evaluate(`document.querySelector('#smoke-files')?.remove()`); }
 }

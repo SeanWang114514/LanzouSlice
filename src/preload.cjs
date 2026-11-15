@@ -17,5 +17,10 @@ contextBridge.exposeInMainWorld('lanzou', {
     const handler = (_event, result) => callback(result);
     ipcRenderer.on('app:recognition', handler);
     return () => ipcRenderer.removeListener('app:recognition', handler);
+  },
+  onOpenSettings(callback) {
+    const handler = () => callback();
+    ipcRenderer.on('app:open-settings', handler);
+    return () => ipcRenderer.removeListener('app:open-settings', handler);
   }
 });

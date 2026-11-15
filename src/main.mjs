@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, session, safeStorage } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, session, safeStorage, powerMonitor, Tray, Menu } from 'electron';
 import { readFile, writeFile, mkdir, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -11,9 +11,11 @@ import { FolderRecognition } from './folder-recognition.mjs';
 import { CloudFiles } from './cloud-files.mjs';
 import { openTaskFolder } from './task-location.mjs';
 import { SyncManager } from './sync.mjs';
+import { DesktopLifecycle } from './desktop-lifecycle.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const smokeTest = process.argv.includes('--smoke-test');
+const lifecycleTest = smokeTest && process.argv.includes('--smoke-lifecycle');
 const smokeOutputArg = process.argv.find(arg => arg.startsWith('--smoke-output='));
 const smokeOutput = path.resolve(smokeOutputArg ? smokeOutputArg.slice('--smoke-output='.length) : '.tmp');
 if (smokeTest) mkdirSync(smokeOutput, { recursive: true });
@@ -27,12 +29,13 @@ const smokeApi = smokeApiArg ? new URL(smokeApiArg.slice('--smoke-api='.length))
 if (smokeApi && (!testDataArg || smokeApi.protocol !== 'http:' || smokeApi.hostname !== '127.0.0.1')) throw new Error('离线界面测试仅允许独立数据目录和本机回环服务');
 if (!app.requestSingleInstanceLock()) app.exit(0);
 const appURL = pathToFileURL(path.join(root, 'ui/index.html')).href;
-let window, loginWindow, engine, client, quitting = false, account = null, encryptionAvailable = false, authVersion = 0;
+let window, loginWindow, engine, client, desktop, quitting = false, shutdownComplete = false, account = null, encryptionAvailable = false, authVersion = 0;
 const bundles = new Map();
 const dataDir = app.getPath('userData');
 const credentialPath = path.join(dataDir, 'session.bin');
 let identifyController, recognition, cloudFiles, sync;
 const seededUploads = new Set();
+let stateTimer = null, lastStateSent = 0;
 function seedUploads(initial = false) {
   let changed = false;
   for (const task of engine.tasks.values()) {
@@ -54,11 +57,18 @@ function bundleInfo(bundle, version) {
   return { key, ...manifestInfo(bundle) };
 }
 
-function snapshot() { return { account, tasks: engine.publicTasks(), sync: sync?.publicState(), dataDir, settings: engine.storage.settings, settingsWarning: engine.storage.warning, version: app.getVersion(), encryptionAvailable, windowState: { maximized: Boolean(window && !window.isDestroyed() && window.isMaximized()), fullscreen: Boolean(window && !window.isDestroyed() && window.isFullScreen()) } }; }
-function emitState() {
+function snapshot() { return { account, tasks: engine.publicTasks(), sync: sync?.publicState(), dataDir, settings: engine.storage.settings, settingsWarning: [engine.storage.warning, desktop?.warning].filter(Boolean).join(' '), startupSupported: Boolean(desktop?.startupSupported), version: app.getVersion(), encryptionAvailable, windowState: { maximized: Boolean(window && !window.isDestroyed() && window.isMaximized()), fullscreen: Boolean(window && !window.isDestroyed() && window.isFullScreen()) } }; }
+function emitState(urgent = true) {
+  if (!window || window.isDestroyed()) return;
+  clearTimeout(stateTimer); stateTimer = null;
+  if (window.isMinimized() || (!smokeTest || lifecycleTest) && !window.isVisible()) return;
+  if (!urgent && Date.now() - lastStateSent < 1000) {
+    stateTimer = setTimeout(() => emitState(), 1000 - (Date.now() - lastStateSent));
+    return;
+  }
   seedUploads();
   if (account && !client.loggedIn) account = null;
-  if (window && !window.isDestroyed()) window.webContents.send('app:state', snapshot());
+  lastStateSent = Date.now(); window.webContents.send('app:state', snapshot());
 }
 async function saveSession(remember, label) {
   account = { label: label || `蓝奏云 ${client.uid}`, uid: client.uid, remembered: Boolean(remember) };
@@ -130,7 +140,14 @@ async function sourceInfo(filePath) {
   if (!info.isFile()) throw new Error('请选择或拖入一个文件，暂不支持上传文件夹');
   return { path: filePath, name: path.basename(filePath), size: info.size };
 }
+async function sourceInfos(paths) {
+  if (!Array.isArray(paths) || !paths.length || paths.length > 200 || paths.some(file => typeof file !== 'string')) throw new Error('每次请选择 1–200 个本机文件');
+  const selected = [];
+  for (const file of paths) selected.push(await sourceInfo(file));
+  return selected;
+}
 async function command(action, payload = {}) {
+  if (quitting && action !== 'state') throw new Error('软件正在退出，请稍后重新打开');
   switch (action) {
     case 'state': return snapshot();
     case 'windowMinimize': window.minimize(); return null;
@@ -161,10 +178,11 @@ async function command(action, payload = {}) {
       await rm(credentialPath, { force: true });
       await authSession().clearStorageData(); emitState(); return snapshot();
     case 'chooseSource': {
-      const result = await dialog.showOpenDialog(window, { title: '选择需要切片上传的文件', properties: ['openFile'] });
-      return result.canceled ? null : sourceInfo(result.filePaths[0]);
+      const result = await dialog.showOpenDialog(window, { title: '选择需要切片上传的文件（最多 200 个）', properties: ['openFile', 'multiSelections'] });
+      return result.canceled ? null : sourceInfos(result.filePaths);
     }
     case 'selectSource': return sourceInfo(String(payload.path || ''));
+    case 'selectSources': return sourceInfos(payload.paths);
     case 'chooseSyncSource': {
       const result = await dialog.showOpenDialog(window, { title: payload.kind === 'directory' ? '选择自动同步文件夹' : '选择自动同步文件', properties: [payload.kind === 'directory' ? 'openDirectory' : 'openFile'] });
       return result.canceled ? null : result.filePaths[0];
@@ -186,9 +204,9 @@ async function command(action, payload = {}) {
       emitState(); return snapshot();
     }
     case 'saveSettings': {
-      const patch = Object.fromEntries(['autoCleanCache', 'uploadConcurrency', 'downloadConcurrency', 'browserView'].filter(key => Object.hasOwn(payload, key)).map(key => [key, payload[key]]));
+      const patch = Object.fromEntries(['autoCleanCache', 'uploadConcurrency', 'downloadConcurrency', 'browserView', 'openAtLogin', 'startHidden', 'closeToTray'].filter(key => Object.hasOwn(payload, key)).map(key => [key, payload[key]]));
       if (!Object.keys(patch).length) throw new Error('没有可保存的设置');
-      await engine.storage.configure(patch);
+      await desktop.configure(patch);
       if (patch.autoCleanCache === true) await engine.cleanCache().catch(error => { engine.storage.warning = `自动清理已开启，部分缓存暂未清理：${error.message}`; });
       emitState(); return snapshot();
     }
@@ -196,6 +214,7 @@ async function command(action, payload = {}) {
     case 'cleanCache': return engine.cleanCache();
     case 'clearHistory': return engine.clearHistory({ scope: payload.scope ?? 'completed', id: payload.id });
     case 'upload': return engine.createUpload(String(payload.path || ''));
+    case 'uploadBatch': return engine.createUploadBatch(payload.paths);
     case 'manageCloud': return cloudFiles.change(payload.action, payload);
     case 'downloadFile': {
       const version = authVersion;
@@ -218,14 +237,12 @@ async function command(action, payload = {}) {
       if (version !== authVersion) throw new Error('账号已变化，请重新读取目录');
       for (const entry of result.entries) {
         if (!entry.isFolder) continue;
-        if (payload.force) recognition.forget(ownerUid, entry.id);
         const cached = recognition.get(ownerUid, entry.id, entry.name);
         if (cached) {
           entry.identification = cached.status; entry.recognitionStale = cached.stale;
           if (cached.status !== 'ordinary') entry.slice = cached;
         }
       }
-      if (payload.force) void recognition.save().catch(() => {});
       return result;
     }
     case 'identifyFolders': {
@@ -260,6 +277,7 @@ async function command(action, payload = {}) {
       const task = engine.tasks.get(String(payload.id));
       if (task?.syncRuleId) await sync.toggle(task.syncRuleId, false); else await engine.pause(String(payload.id)); return null;
     }
+    case 'cancel': return engine.cancel(payload.ids);
     case 'pauseAll':
       for (const rule of sync.publicState().rules) if (rule.enabled || rule.state === 'queued' || sync.active?.id === rule.id) await sync.toggle(rule.id, false);
       await engine.pauseAll(); return null;
@@ -291,7 +309,7 @@ recognition = new FolderRecognition({ dataDir, identify: async (id, signal) => {
   const { index, bundle, ordinary } = await engine.identifyFolder(id, signal);
   return ordinary ? { status: 'ordinary' } : index ? { status: 'preview', ...index } : { status: 'ready', ...manifestInfo(bundle) };
 } });
-await recognition.init(); seedUploads(true); engine.on('change', emitState);
+await recognition.init(); seedUploads(true); engine.on('update', emitState);
 cloudFiles = new CloudFiles({ client, engine, recognition, version: () => authVersion, cancelReads: resetReads });
 sync = new SyncManager({ engine, dataDir, busy: () => cloudFiles.busy, version: () => authVersion });
 await sync.init(); sync.on('change', emitState); sync.start();
@@ -303,15 +321,61 @@ ipcMain.handle('app:command', async (event, { action, payload }) => {
     if (error.code === 'AUTH_EXPIRED') { account = null; emitState(); }
     return { ok: false, error: error.message || '操作失败', code: error.code };
   }
+  finally { sync.schedule(); }
 });
-window = new BrowserWindow({ width: 1260, height: 900, minWidth: 940, minHeight: 700, frame: false, show: !smokeTest, title: '蓝奏切片', backgroundColor: '#e4e6ee', icon: path.join(root, 'ui/assets/app-icon.png'), autoHideMenuBar: true, webPreferences: { preload: path.join(root, 'src/preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, offscreen: smokeTest } });
+window = new BrowserWindow({ width: 1260, height: 900, minWidth: 940, minHeight: 700, frame: false, show: false, paintWhenInitiallyHidden: smokeTest && !lifecycleTest, title: '蓝奏切片', backgroundColor: '#e4e6ee', icon: path.join(root, 'ui/assets/app-icon.png'), autoHideMenuBar: true, webPreferences: { preload: path.join(root, 'src/preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, offscreen: smokeTest && !lifecycleTest } });
+let smokeLogin = { openAtLogin: false, executableWillLaunchAtLogin: false };
+const loginItems = smokeTest ? {
+  getLoginItemSettings: () => ({ openAtLogin: false, executableWillLaunchAtLogin: smokeLogin.executableWillLaunchAtLogin, launchItems: smokeLogin.openAtLogin ? [{ name: smokeLogin.name, path: smokeLogin.path, args: [], scope: 'user', enabled: smokeLogin.executableWillLaunchAtLogin }] : [] }),
+  setLoginItemSettings: value => { smokeLogin = { ...value, executableWillLaunchAtLogin: value.openAtLogin && value.enabled }; }
+} : app;
+desktop = new DesktopLifecycle({ app, window, Tray, Menu, storage: engine.storage, icon: path.join(root, 'ui/assets/app-icon.ico'), isQuitting: () => quitting, loginItems, startupSupported: process.platform === 'win32' && (app.isPackaged || smokeTest) });
+desktop.initialize();
+app.on('before-quit', event => {
+  if (shutdownComplete) return;
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
+  clearTimeout(stateTimer); stateTimer = null;
+  resetReads();
+  void Promise.allSettled([
+    sync.close().then(() => engine.pauseAll()).then(() => recognition.save()),
+    desktop.queue.catch(() => {}).then(() => engine.storage.queue)
+  ]).finally(() => { shutdownComplete = true; trace('shutdown saved'); app.quit(); });
+});
+app.on('will-quit', () => desktop.destroy());
+app.on('window-all-closed', () => app.quit());
 for (const event of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) window.on(event, emitState);
+for (const event of ['restore', 'show', 'hide', 'minimize']) window.on(event, () => emitState());
+powerMonitor.on('resume', () => { emitState(); sync.wake(); });
 trace('window created');
 window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 window.webContents.on('will-navigate', (event, url) => { if (url !== appURL) event.preventDefault(); });
-app.on('second-instance', () => { if (window.isMinimized()) window.restore(); window.show(); window.focus(); });
+app.on('second-instance', (_event, argv) => { if (!argv.includes('--autostart')) desktop.show(); });
 await window.loadURL(appURL);
+if ((!smokeTest || lifecycleTest) && (!engine.storage.settings.startHidden || !desktop.tray)) desktop.show();
 trace('window loaded');
+if (lifecycleTest) {
+  if (!testDataArg || !smokeApi) throw new Error('启动与托盘测试需要隔离数据目录和本机模拟服务');
+  try {
+    await (await import('./desktop-lifecycle-checks.mjs')).checkLifecycle(window, { app, desktop, engine, sync, outputDir: smokeOutput, phase: process.argv.find(arg => arg.startsWith('--lifecycle-phase='))?.slice('--lifecycle-phase='.length) });
+  } catch (error) { console.error(error.stack || error.message); app.exit(1); }
+  return;
+}
+if (smokeTest && process.argv.includes('--smoke-transfers')) {
+  try {
+    await (await import('./desktop-transfer-checks.mjs')).checkTransfers(window, { app, engine, outputDir: smokeOutput });
+    quitting = true; app.exit(0);
+  } catch (error) { console.error(error.stack || error.message); quitting = true; app.exit(1); }
+  return;
+}
+if (smokeTest && process.argv.includes('--smoke-performance')) {
+  try {
+    await (await import('./desktop-performance-checks.mjs')).checkPerformance(window, { app, engine, sync, outputDir: smokeOutput, setAccount: value => { account = value; } });
+    quitting = true; app.exit(0);
+  } catch (error) { console.error(error.stack || error.message); quitting = true; app.exit(1); }
+  return;
+}
 if (smokeTest) {
   try {
     const features = smokeApi ? process.argv.includes('--smoke-sync') ? await (await import('./desktop-sync-checks.mjs')).checkSync(window, {
@@ -320,12 +384,14 @@ if (smokeTest) {
       firstFile: process.argv.find(arg => arg.startsWith('--smoke-drop-file='))?.slice('--smoke-drop-file='.length),
       secondFile: process.argv.find(arg => arg.startsWith('--smoke-second-file='))?.slice('--smoke-second-file='.length),
       fixtureOrigin: smokeApi.origin,
-      outputDir: smokeOutput
+      outputDir: smokeOutput, recognition
     }) : undefined;
     const result = await window.webContents.executeJavaScript(`(async()=>{
       const state=await window.lanzou.call('state');
+      document.querySelector('#tab-transfers').click();
+      for(const id of ['transfer-type','transfer-state']) {document.querySelector('#'+id).value='all';document.querySelector('#'+id).dispatchEvent(new Event('change'));}
       const until=Date.now()+5000;
-      while(document.querySelectorAll('#tasks .task').length!==state.tasks.length) {
+      while(document.querySelectorAll('#tasks .task').length!==Math.min(50,state.tasks.length)) {
         if(Date.now()>until) throw new Error('任务列表未完成渲染：'+document.querySelector('#notice').textContent);
         await new Promise(resolve=>setTimeout(resolve,25));
       }
@@ -334,7 +400,7 @@ if (smokeTest) {
       document.querySelector('#share-source').click();
       const shareTabWorks=!document.querySelector('#share-form').hidden;
       document.querySelector('#tab-upload').click();
-      const namingVisible=state.tasks.every(task=>!task.naming||[...document.querySelectorAll('#tasks .task-detail')].some(node=>node.textContent.includes(task.naming.cloudFolderName)));
+      const namingVisible=state.tasks.slice(-50).every(task=>!task.naming||[...document.querySelectorAll('#tasks .task-detail')].some(node=>node.textContent.includes(task.naming.cloudFolderName)));
       if(state.tasks.length) { document.querySelector('#tab-transfers').click(); document.querySelector('#tasks').scrollIntoView({block:'end'}); }
       return {title:document.title,version:state.version,hasBridge:!!window.lanzou,taskCount:state.tasks.length,renderedTaskCount:document.querySelectorAll('#tasks .task').length,namingVisible,upload:!!document.querySelector('#start-upload'),download:!!document.querySelector('#start-download'),status:document.querySelector('#account-status').textContent,downloadTabWorks,shareTabWorks};
     })()`);
@@ -350,17 +416,10 @@ if (smokeTest) {
     const screenshot = await window.webContents.capturePage();
     await writeFile(path.join(smokeOutput, 'desktop-smoke.png'), screenshot.toPNG());
     console.log('DESKTOP_SMOKE', JSON.stringify(result));
-    if (!result.hasBridge || !result.upload || !result.download || !result.downloadTabWorks || !result.shareTabWorks || !result.namingVisible || result.renderedTaskCount !== result.taskCount) throw new Error('桌面组件未完整加载');
+    if (!result.hasBridge || !result.upload || !result.download || !result.downloadTabWorks || !result.shareTabWorks || !result.namingVisible || result.renderedTaskCount !== Math.min(50, result.taskCount)) throw new Error('桌面组件未完整加载');
     quitting = true; app.exit(0);
-  } catch (error) { console.error(error.message); quitting = true; app.exit(1); }
+  } catch (error) { console.error(error.stack || error.message); quitting = true; app.exit(1); }
 } else void restoreSession().then(() => { emitState(); sync.wake(); });
-app.on('before-quit', event => {
-  if (quitting) return;
-  event.preventDefault(); quitting = true;
-  resetReads();
-  void sync.close().then(() => engine.pauseAll()).then(() => recognition.save()).catch(() => {}).finally(() => app.quit());
-});
-app.on('window-all-closed', () => app.quit());
 }).catch(error => {
   trace(`startup error: ${error.message}`);
   console.error('启动失败：', error);

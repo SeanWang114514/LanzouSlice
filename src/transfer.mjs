@@ -205,10 +205,11 @@ export class TransferEngine extends EventEmitter {
     this.storage = new LocalStorage(dataDir, defaultDownloadDir);
   }
   taskDir(id) { if (!/^[a-f\d-]{36}$/.test(id)) throw new Error('无效任务 ID'); return path.join(this.dataDir, 'tasks', id); }
-  publicTasks() { return [...this.tasks.values()].map(({ sourcePath, password, manifest, ...task }) => ({ ...task, originalSize: manifest?.originalSize ?? task.originalSize, originalName: manifest?.originalName ?? task.originalName, totalParts: manifest?.parts.length ?? task.totalParts, ...(this.meters.get(task.id)?.read(task) || { elapsedMs: task.elapsedMs || 0, speedBytesPerSecond: 0, remainingSeconds: null, transferredBytes: 0 }) })); }
+  publicTasks() { return [...this.tasks.values()].map(({ sourcePath, sourceMtime, password, manifest, receipts, files, source, ...task }) => ({ ...task, ...(source ? { source: { kind: source.kind, folderId: source.folderId, ...(source.file ? { file: { id: source.file.id, name: source.file.name } } : {}) } } : {}), originalSize: manifest?.originalSize ?? task.originalSize, originalName: manifest?.originalName ?? task.originalName, totalParts: manifest?.parts.length ?? task.totalParts, ...(this.meters.get(task.id)?.read(task) || { elapsedMs: task.elapsedMs || 0, speedBytesPerSecond: 0, remainingSeconds: null, transferredBytes: 0 }) })); }
   notify(force = false) {
-    if (!force && Date.now() - this.lastEmit < 180) return;
-    this.lastEmit = Date.now(); this.emit('change', this.publicTasks());
+    if (!force && Date.now() - this.lastEmit < 1000) return;
+    this.lastEmit = Date.now(); this.emit('update', force);
+    if (this.listenerCount('change')) this.emit('change', this.publicTasks());
   }
   async persist(task) {
     const previous = this.persistQueue.get(task.id) || Promise.resolve();
@@ -220,7 +221,9 @@ export class TransferEngine extends EventEmitter {
       if (task.syncRuleId && this.persistSyncTask) await this.persistSyncTask(snapshot);
       await atomicJSON(path.join(this.taskDir(task.id), 'task.json'), snapshot);
     });
-    this.persistQueue.set(task.id, next); await next;
+    this.persistQueue.set(task.id, next);
+    try { await next; }
+    finally { if (this.persistQueue.get(task.id) === next) this.persistQueue.delete(task.id); }
   }
   async init() {
     const root = path.join(this.dataDir, 'tasks'); await mkdir(root, { recursive: true });
@@ -230,7 +233,7 @@ export class TransferEngine extends EventEmitter {
       try {
         const task = JSON.parse(await readFile(path.join(root, item.name, 'task.json'), 'utf8'));
         if (task.id !== item.name || !['upload','download'].includes(task.type)) continue;
-        if (!['completed','failed','paused'].includes(task.state)) { task.state = 'paused'; task.message = '程序关闭前未完成，可继续任务'; }
+        if (!['completed','failed','paused','canceled'].includes(task.state)) { task.state = 'paused'; task.message = '程序关闭前未完成，可继续任务'; }
         this.tasks.set(task.id, task);
       } catch { /* A damaged journal does not prevent other tasks from opening. */ }
     }
@@ -238,7 +241,7 @@ export class TransferEngine extends EventEmitter {
     return this.publicTasks();
   }
   protectedCachePaths(exceptId) {
-    return new Set([...this.tasks.values()].filter(task => task.id !== exceptId && (task.state !== 'completed' || this.active.has(task.id))).map(task => diskKey(this.storage.directory(task, this.taskDir(task.id)))));
+    return new Set([...this.tasks.values()].filter(task => task.id !== exceptId && (!['completed', 'canceled'].includes(task.state) || this.active.has(task.id))).map(task => diskKey(this.storage.directory(task, this.taskDir(task.id)))));
   }
   protectedFiles() { return new Set([...this.tasks.values()].flatMap(task => [task.sourcePath, task.resultPath]).filter(Boolean).map(diskKey)); }
   async cacheInfo() {
@@ -253,18 +256,18 @@ export class TransferEngine extends EventEmitter {
   async cleanCache() {
     let files = 0, bytes = 0;
     const protectedPaths = this.protectedCachePaths();
-    for (const task of this.tasks.values()) if (task.state === 'completed' && !this.active.has(task.id)) {
+    for (const task of this.tasks.values()) if (['completed', 'canceled'].includes(task.state) && !this.active.has(task.id)) {
       const result = await this.storage.clean(task, this.taskDir(task.id), protectedPaths, this.protectedFiles()); files += result.files; bytes += result.bytes;
     }
     return { files, bytes };
   }
   async clearHistory({ scope = 'completed', id } = {}) {
     if (!['completed', 'all'].includes(scope) || id !== undefined && !/^[a-f\d-]{36}$/.test(id)) throw new Error('历史清理参数无效');
-    if (this.clearingHistory) throw new Error('正在清空历史，请稍候');
+    if (this.clearingHistory || this.canceling) throw new Error('正在清理或取消任务，请稍候');
     this.clearingHistory = true;
     let removed = 0;
     try {
-      const selected = [...this.tasks.values()].filter(task => (!id || task.id === id) && (task.state === 'completed' || scope === 'all' && task.state === 'failed') && !this.active.has(task.id) && !this.syncPendingIds?.has(task.id));
+      const selected = [...this.tasks.values()].filter(task => (!id || task.id === id) && (task.state === 'completed' || scope === 'all' && ['failed', 'canceled'].includes(task.state)) && !this.active.has(task.id) && !this.syncPendingIds?.has(task.id));
       const ids = new Set(selected.map(task => task.id));
       const protectedPaths = new Set([...this.tasks.values()].filter(task => !ids.has(task.id)).map(task => diskKey(this.storage.directory(task, this.taskDir(task.id))))), protectedFiles = this.protectedFiles();
       for (const task of selected) {
@@ -279,13 +282,14 @@ export class TransferEngine extends EventEmitter {
     } finally { this.clearingHistory = false; this.notify(true); this.startNextDownload(); }
   }
   start(task, work) {
+    if (task.state === 'canceled' || this.canceling && !task.syncRuleId) throw new Error('任务已取消或正在取消任务');
     if (this.syncOwner && task.syncRuleId !== this.syncOwner) throw new Error('自动同步正在运行，请等待或先暂停同步规则');
     if (task.syncRuleId && this.syncOwner !== task.syncRuleId) throw new Error('请从自动同步页面继续此规则');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
-    if (this.creatingBatch || this.pausingAll) throw new Error('正在准备或暂停批量任务，请稍候');
+    if (this.pausingAll || this.creatingBatch && !task.syncRuleId) throw new Error('正在准备或暂停批量任务，请稍候');
     if (this.active.has(task.id)) throw new Error('任务已经在运行');
-    // A single active transfer keeps global request concurrency bounded.
-    if (this.active.size) throw new Error('请等待当前任务完成，或先暂停当前任务');
+    // Sync files share one request budget; manual transfers still run one at a time.
+    if (this.active.size && (!task.syncRuleId || [...this.active.keys()].some(id => this.tasks.get(id)?.syncRuleId !== task.syncRuleId) || this.active.size >= this.syncUploadLimit)) throw new Error('请等待当前任务完成，或先暂停当前任务');
     const controller = new AbortController(); this.active.set(task.id, controller);
     task.state = 'running'; task.error = ''; this.meters.set(task.id, new TransferMeter(task.elapsedMs));
     if (!this.tick) { this.tick = setInterval(() => this.notify(), 500); this.tick.unref(); }
@@ -299,7 +303,7 @@ export class TransferEngine extends EventEmitter {
         task.state = controller.signal.aborted ? 'paused' : 'failed';
         task.error = controller.signal.aborted ? '' : (error.message || '任务失败');
         task.message = controller.signal.aborted ? '已暂停，可继续' : task.error;
-        if (error.code === 'AUTH_EXPIRED') { task.message = '登录已过期，请重新登录后继续'; await this.pauseQueued(task.message).catch(error => { task.message += `；排队记录保存失败：${error.message}`; }); }
+        if (error.code === 'AUTH_EXPIRED') { this.queueEpoch = (this.queueEpoch || 0) + 1; task.message = '登录已过期，请重新登录后继续'; await this.pauseQueued(task.message).catch(error => { task.message += `；排队记录保存失败：${error.message}`; }); }
       } finally {
         task.elapsedMs = this.meters.get(task.id).read(task).elapsedMs; this.meters.delete(task.id);
         task.lastStoppedAt = new Date().toISOString();
@@ -316,9 +320,39 @@ export class TransferEngine extends EventEmitter {
     return task.id;
   }
   startNextDownload() {
-    if (this.syncOwner || this.active.size || this.creatingBatch || this.pausingAll || this.clearingHistory || !this.client.loggedIn) return;
-    const task = [...this.tasks.values()].find(task => task.state === 'queued' && task.ownerUid === this.client.uid);
-    if (task) this.start(task, signal => this.runDownload(task, signal));
+    if (this.syncOwner || this.active.size || this.creatingTasks || this.creatingBatch || this.pausingAll || this.clearingHistory || this.canceling) return;
+    const task = [...this.tasks.values()].find(task => task.state === 'queued' && !task.syncRuleId && (!task.ownerUid || this.client.loggedIn && String(task.ownerUid) === String(this.client.uid)));
+    if (task) this.start(task, signal => task.type === 'upload' ? this.runUpload(task, signal) : this.runDownload(task, signal));
+  }
+  async enqueue(task, batch = false) {
+    if (task.syncRuleId) throw new Error('请从自动同步页面继续此规则');
+    if (task.state === 'canceled') throw new Error('已取消的任务无法继续，请重新创建');
+    if (this.clearingHistory || this.creatingBatch && !batch || this.pausingAll || this.canceling) throw new Error('正在处理任务，请稍候');
+    if (this.active.has(task.id)) throw new Error('任务已经在运行');
+    if (this.enqueuingIds?.has(task.id)) throw new Error('任务正在加入队列，请稍候');
+    if (task.ownerUid && (!this.client.loggedIn || String(task.ownerUid) !== String(this.client.uid))) throw new Error('请登录创建此任务的蓝奏云账号后继续');
+    if (task.state === 'queued') return task.id;
+    const epoch = this.queueEpoch || 0;
+    const newTask = !this.tasks.has(task.id);
+    const check = () => { if (epoch !== (this.queueEpoch || 0) || task.ownerUid && (!this.client.loggedIn || String(task.ownerUid) !== String(this.client.uid))) throw new Error('账号或任务状态已变化，已停止加入队列'); };
+    this.creatingTasks = (this.creatingTasks || 0) + 1;
+    this.enqueuingIds ||= new Set(); this.enqueuingIds.add(task.id);
+    task.state = 'paused'; task.message = '正在准备任务';
+    // Map insertion order is the submission order, including resumed tasks.
+    this.tasks.delete(task.id); this.tasks.set(task.id, task);
+    try {
+      if (newTask) task.cachePath = await this.storage.allocate(task.id);
+      check();
+      await this.persist(task); check();
+      task.state = 'queued'; task.error = ''; task.message = '排队等待' + (task.type === 'upload' ? '上传' : '下载');
+      await this.persist(task); check();
+      return task.id;
+    } catch (error) {
+      task.state = 'paused'; task.message = `任务未加入队列：${error.message}`;
+      if (newTask && !task.cachePath) this.tasks.delete(task.id);
+      else await this.persist(task).catch(() => {});
+      throw error;
+    } finally { this.enqueuingIds.delete(task.id); this.creatingTasks--; if (!batch) this.notify(true); this.startNextDownload(); }
   }
   async pauseQueued(message = '已暂停，可继续') {
     const queued = [...this.tasks.values()].filter(task => task.state === 'queued');
@@ -333,26 +367,104 @@ export class TransferEngine extends EventEmitter {
   async pauseAll() {
     if (this.pausePromise) return this.pausePromise;
     this.queueEpoch = (this.queueEpoch || 0) + 1; this.pausingAll = true;
-    this.pausePromise = Promise.all([this.pauseQueued(), ...[...this.active.keys()].map(id => this.pause(id))]);
+    this.pausePromise = (async () => { await this.cancelPromise; await Promise.all([this.pauseQueued(), ...[...this.active.keys()].map(id => this.pause(id))]); })();
     try { await this.pausePromise; }
     finally { this.pausingAll = false; this.pausePromise = null; this.notify(true); }
   }
+  async cancel(ids) {
+    if (!Array.isArray(ids) || !ids.length || ids.length > 200 || ids.some(id => typeof id !== 'string' || !/^[a-f\d-]{36}$/.test(id)) || new Set(ids).size !== ids.length) throw new Error('每次请选择 1–200 个不同的任务');
+    if (this.canceling || this.clearingHistory || this.creatingTasks || this.creatingBatch || this.pausingAll) throw new Error('正在准备或处理任务，请稍候再取消');
+    const selected = ids.map(id => this.tasks.get(id)).filter(task => task && !['completed', 'canceled'].includes(task.state));
+    if (selected.some(task => task.syncRuleId || this.syncPendingIds?.has(task.id))) throw new Error('自动同步任务请到自动同步页面暂停规则');
+    this.canceling = true;
+    const result = { canceled: 0, skipped: ids.length - selected.length, failures: [] };
+    this.cancelPromise = (async () => {
+      try {
+        // Reserve every queued selection before awaiting an active worker's final writes.
+        for (const task of selected) if (task.state === 'queued') { task.state = 'paused'; task.message = '正在取消'; }
+        await Promise.all(selected.map(task => this.pause(task.id)));
+        for (const task of selected) {
+          if (task.state === 'completed') { result.skipped++; continue; }
+          try {
+            await this.persistQueue.get(task.id);
+            const terminal = { state: 'canceled', error: '', message: '已取消，无法继续；原文件与下载结果保留', lastStoppedAt: new Date().toISOString() };
+            try { await this.persist({ ...task, ...terminal }); }
+            catch (error) { task.state = 'paused'; task.message = task.error = `取消状态保存失败，请重试：${error.message}`; throw error; }
+            Object.assign(task, terminal);
+            result.canceled++;
+            await this.storage.clean(task, this.taskDir(task.id), this.protectedCachePaths(task.id), this.protectedFiles());
+          } catch (error) {
+            if (task.state === 'canceled') task.message += `；缓存待清理：${error.message}`;
+            result.failures.push({ id: task.id, error: error.message });
+          }
+        }
+        return result;
+      } finally { this.canceling = false; this.cancelPromise = null; this.notify(true); this.startNextDownload(); }
+    })();
+    return this.cancelPromise;
+  }
   async createUpload(sourcePath, options = {}) {
-    if (this.syncOwner && options.syncRuleId !== this.syncOwner) throw new Error('自动同步正在运行，请稍候');
+    if (!this.client.loggedIn) throw new LanzouError('请先登录蓝奏云', 'AUTH_EXPIRED');
+    const ownerUid = this.client.uid, epoch = this.queueEpoch || 0;
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
-    if (this.active.size) throw new Error('请先完成或暂停当前任务');
     const info = await stat(sourcePath); if (!info.isFile()) throw new Error('请选择文件');
+    if (!this.client.loggedIn || ownerUid !== this.client.uid || epoch !== (this.queueEpoch || 0)) throw new Error('账号或任务状态已变化，请重新上传');
     localFileName(path.basename(sourcePath));
     const id = options.id || randomUUID();
     const task = { id, type: 'upload', sourcePath, originalName: path.basename(sourcePath), originalSize: info.size, sourceMtime: info.mtimeMs, totalParts: planParts(info.size, this.maxPartBytes).length, concurrency: this.storage.settings.uploadConcurrency, createdAt: new Date().toISOString(), state: 'paused', progress: 0, phase: 'prepare', message: '准备上传', receipts: {} };
-    if (options.syncRuleId) Object.assign(task, { syncRuleId: options.syncRuleId, parentFolderId: options.parentFolderId, syncRelativePath: options.relativePath, sourceSha256: options.sha256 });
-    task.ownerUid = this.client.uid; task.cachePath = await this.storage.allocate(id);
+    if (options.syncRuleId) Object.assign(task, { syncRuleId: options.syncRuleId, parentFolderId: options.parentFolderId, syncRelativePath: options.relativePath, sourceSha256: options.sha256, concurrency: this.syncUploadLimit });
+    task.ownerUid = ownerUid;
+    if (!task.syncRuleId) return this.enqueue(task, options.batch === true);
+    task.cachePath = await this.storage.allocate(id);
     this.tasks.set(id, task); await this.persist(task);
     return this.start(task, signal => this.runUpload(task, signal));
   }
+  async createUploadBatch(paths) {
+    if (this.creatingBatch || this.pausingAll || this.clearingHistory || this.canceling) throw new Error('正在处理任务，请稍候');
+    if (!this.client.loggedIn) throw new LanzouError('请先登录蓝奏云', 'AUTH_EXPIRED');
+    if (!Array.isArray(paths) || !paths.length || paths.length > 200 || paths.some(file => typeof file !== 'string' || !path.isAbsolute(file))) throw new Error('每次请选择 1–200 个本机文件');
+    const keys = paths.map(file => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file));
+    if (new Set(keys).size !== keys.length) throw new Error('同一批文件不能重复');
+    const ownerUid = this.client.uid, epoch = this.queueEpoch || 0, ids = [], failures = [], pendingPaths = [];
+    const changed = () => !this.client.loggedIn || ownerUid !== this.client.uid || epoch !== (this.queueEpoch || 0);
+    let stopped = '';
+    this.creatingBatch = true;
+    try {
+      for (const [index, file] of paths.entries()) {
+        if (changed()) { stopped = '账号或任务状态已变化，批量加入已停止'; pendingPaths.push(...paths.slice(index)); break; }
+        const id = randomUUID();
+        try { ids.push(await this.createUpload(file, { id, batch: true })); }
+        catch (error) {
+          failures.push({ path: file, error: error.message });
+          if (this.tasks.has(id)) ids.push(id); else pendingPaths.push(file);
+        }
+      }
+      if (changed()) stopped = '账号或任务状态已变化，批量加入已停止';
+      return { ids, failures, pendingPaths, stopped, paused: ids.filter(id => this.tasks.get(id).state === 'paused').length };
+    } finally { this.creatingBatch = false; this.notify(true); this.startNextDownload(); }
+  }
   progress(task, phase, bytes, total, message) {
+    const changedPhase = task.phase !== phase;
     task.phase = phase; task.bytes = bytes; task.totalBytes = total; task.progress = total ? bytes / total : 0;
-    task.message = message; this.notify();
+    task.message = message; this.notify(changedPhase);
+  }
+  async withUploadSlot(task, signal, work) {
+    const slots = task.syncRuleId ? (this.syncUploadSlots ||= new Set()) : null;
+    while (slots && slots.size >= this.syncUploadLimit) { signal.throwIfAborted(); await Promise.race([...slots].map(slot => slot.done)); }
+    signal.throwIfAborted();
+    let release;
+    const slot = { done: new Promise(resolve => { release = resolve; }) }; slots?.add(slot);
+    try { return await work(); }
+    finally { slots?.delete(slot); release(); }
+  }
+  async uploadFile(task, filename, name, { signal, onProgress, slotHeld = false } = {}) {
+    let previous = 0;
+    const upload = () => this.client.upload(filename, name, task.folderId, { signal, onProgress: bytes => {
+        const delta = Math.max(0, bytes - previous); previous = bytes;
+        this.meters.get(task.id)?.add(delta); if (task.syncRuleId) this.syncTraffic?.(task, delta);
+        onProgress?.(bytes);
+    } });
+    return slotHeld ? upload() : this.withUploadSlot(task, signal, upload);
   }
   async runUpload(task, signal) {
     if (!this.client.loggedIn) throw new LanzouError('请先登录', 'AUTH_EXPIRED');
@@ -420,8 +532,7 @@ export class TransferEngine extends EventEmitter {
             }
             record.attempted = true; await this.persist(task);
             report(part.index, 0);
-            let previous = 0;
-            return await this.client.upload(zipPath, part.name, task.folderId, { signal, onProgress: bytes => { this.meters.get(task.id)?.add(bytes - previous); previous = bytes; report(part.index, bytes); } });
+            return await this.uploadFile(task, zipPath, part.name, { signal, slotHeld: true, onProgress: bytes => report(part.index, bytes) });
           } catch (error) {
             if (signal.aborted || ['AUTH_EXPIRED','VERIFY_REQUIRED'].includes(error.code) || /重复切片|校验|不匹配/.test(error.message) || attempt === 2) throw error;
             await delay((error.code === 'RATE_LIMIT' ? 3000 : 1000) * 2 ** attempt, undefined, { signal });
@@ -434,7 +545,7 @@ export class TransferEngine extends EventEmitter {
     const worker = async () => {
       while (next < parts.length && !combined.aborted) {
         const part = parts[next++];
-        try { await transferPart(part); }
+        try { await this.withUploadSlot(task, combined, () => transferPart(part)); }
         catch (error) { firstError ||= error; workers.abort(error); }
       }
     };
@@ -458,7 +569,7 @@ export class TransferEngine extends EventEmitter {
         const remoteManifest = await this.readRemoteManifest(candidate[0], { signal });
         if (JSON.stringify(remoteManifest) !== JSON.stringify(manifest)) throw new Error('远程清单与当前任务冲突');
         task.manifestId = candidate[0].id;
-      } else task.manifestId = await this.client.upload(manifestPath, MANIFEST_NAME, task.folderId, { signal });
+      } else task.manifestId = await this.uploadFile(task, manifestPath, MANIFEST_NAME, { signal });
       await this.persist(task);
     }
     // Publish only after the authoritative manifest has been committed. Failure is optional.
@@ -472,7 +583,7 @@ export class TransferEngine extends EventEmitter {
         const indexPath = path.join(dir, 'slice-index.txt');
         await atomicJSON(indexPath, { format: 'lanzou-slice-index', version: 1, originalName: manifest.originalName, originalSize: manifest.originalSize, totalParts: parts.length, manifestId: String(task.manifestId), sha256: manifest.sha256 });
         task.indexName = indexName;
-        task.indexId = indexes[0]?.id || await this.client.upload(indexPath, indexName, task.folderId, { signal });
+        task.indexId = indexes[0]?.id || await this.uploadFile(task, indexPath, indexName, { signal });
         await this.persist(task);
       } catch (error) {
         if (signal.aborted) throw error;
@@ -522,21 +633,16 @@ export class TransferEngine extends EventEmitter {
     return { manifest, source, files: resolved, password: options.password || '', indexNames };
   }
   async createDownload(bundle, outputDir = this.storage.settings.downloadDir, concurrency = this.storage.settings.downloadConcurrency) {
-    if (this.syncOwner) throw new Error('自动同步正在运行，请稍候');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
-    if (this.active.size) throw new Error('请先完成或暂停当前任务');
     validateManifest(bundle.manifest);
     if (!path.isAbsolute(outputDir)) throw new Error('请选择有效的下载目录');
     if (!isConcurrency(concurrency)) throw new Error('并发数必须为 1–8 的整数');
     const task = { id: randomUUID(), type: 'download', createdAt: new Date().toISOString(), state: 'paused', progress: 0, phase: 'prepare', message: '准备下载', manifest: bundle.manifest, source: bundle.source, files: bundle.files, password: bundle.password || '', outputDir, concurrency };
     if (task.source.kind === 'account') task.ownerUid = this.client.uid;
-    task.cachePath = await this.storage.allocate(task.id);
-    this.tasks.set(task.id, task); await this.persist(task);
-    return this.start(task, signal => this.runDownload(task, signal));
+    return this.enqueue(task);
   }
   async createDownloadBatch(files, outputDir = this.storage.settings.downloadDir, concurrency = this.storage.settings.downloadConcurrency) {
-    if (this.syncOwner) throw new Error('自动同步正在运行，请稍候');
-    if (this.creatingBatch || this.pausingAll || this.clearingHistory) throw new Error('正在处理任务，请稍候');
+    if (this.creatingBatch || this.pausingAll || this.clearingHistory || this.canceling) throw new Error('正在处理任务，请稍候');
     if (!this.client.loggedIn) throw new LanzouError('请先登录蓝奏云', 'AUTH_EXPIRED');
     if (!Array.isArray(files) || !files.length || files.length > 200 || !path.isAbsolute(outputDir) || !isConcurrency(concurrency)) throw new Error('批量下载参数无效');
     const keys = new Set();
@@ -619,16 +725,12 @@ export class TransferEngine extends EventEmitter {
     task.resultPath = result.path; task.message = '下载、合并及 SHA-256 校验完成';
   }
   async createFileDownload(file, outputDir = this.storage.settings.downloadDir) {
-    if (this.syncOwner) throw new Error('自动同步正在运行，请稍候');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
-    if (this.active.size) throw new Error('请先完成或暂停当前任务');
     if (!this.client.loggedIn) throw new LanzouError('请先登录蓝奏云', 'AUTH_EXPIRED');
     if (file.isFolder || !/^\d+$/.test(String(file.id)) || typeof file.name !== 'string' || !file.name || !path.isAbsolute(outputDir)) throw new Error('文件或下载目录无效');
     const task = { id: randomUUID(), type: 'download', downloadKind: 'file', originalName: file.name, originalSize: file.size || 0, source: { kind: 'account', folderId: file.parentId, file: { id: file.id, name: file.name } }, ownerUid: this.client.uid,
       outputDir, concurrency: 1, createdAt: new Date().toISOString(), state: 'paused', phase: 'prepare', progress: 0, message: '准备下载普通文件' };
-    task.cachePath = await this.storage.allocate(task.id);
-    this.tasks.set(task.id, task); await this.persist(task);
-    return this.start(task, signal => this.runFileDownload(task, signal));
+    return this.enqueue(task);
   }
   async runFileDownload(task, signal) {
     if (!this.client.loggedIn) throw new LanzouError('请登录后继续下载', 'AUTH_EXPIRED');
@@ -686,11 +788,11 @@ export class TransferEngine extends EventEmitter {
     } finally { if (temporaryCreated) await rm(temporary, { force: true }).catch(() => {}); }
   }
   async resume(id, password = '') {
-    const task = this.tasks.get(id); if (!task || task.state === 'completed') throw new Error('此任务无法继续');
+    const task = this.tasks.get(id); if (!task || ['completed', 'canceled'].includes(task.state)) throw new Error('此任务无法继续');
     if (this.active.has(id)) throw new Error('任务已经在运行');
     task.concurrency = task.downloadKind === 'file' ? 1 : this.storage.settings[task.type === 'upload' ? 'uploadConcurrency' : 'downloadConcurrency'];
     if (password) task.password = password;
-    return this.start(task, signal => task.type === 'upload' ? this.runUpload(task, signal) : this.runDownload(task, signal));
+    return this.enqueue(task);
   }
   async exportManifest(id, destination) {
     const task = this.tasks.get(id); if (!task?.manifest) throw new Error('任务尚未生成正式清单');

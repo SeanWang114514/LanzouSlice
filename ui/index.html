@@ -39,7 +39,12 @@
       <nav class="tabs" aria-label="传输模式"><button id="tab-upload" class="tab active" aria-selected="true">切片上传</button><button id="tab-download" class="tab" aria-selected="false">下载与合并</button><button id="tab-sync" class="tab" aria-selected="false">自动同步</button><button id="tab-transfers" class="tab" aria-selected="false">上传下载</button><button id="tab-settings" class="tab" aria-selected="false">设置与清理</button></nav>
       <section id="upload-panel" class="panel operation-panel">
         <div class="upload-heading"><h2>上传文件</h2><span id="upload-concurrency-label" class="muted small">上传并发 2 路</span></div>
-        <button id="choose-source" class="file-picker"><span class="file-icon" data-icon="upload" aria-hidden="true"></span><strong id="source-name">点击选择文件，或拖到这里</strong><span id="source-path">已登录且空闲时，拖入即上传</span><span id="source-size" class="source-size" hidden></span></button>
+        <button id="choose-source" class="file-picker"><span class="file-icon" data-icon="upload" aria-hidden="true"></span><strong id="source-name">多选文件，或批量拖到这里</strong><span id="source-path">每次最多 200 个；登录后拖入即排队上传</span><span id="source-size" class="source-size" hidden></span></button>
+        <fieldset id="source-selection" class="source-selection" aria-label="已选上传文件" hidden>
+          <div class="source-selection-toolbar"><label><input id="source-select-all" type="checkbox"> 全选</label><small id="source-selection-count" class="muted" role="status">待移除 0 项</small><button id="remove-sources" class="text-button" disabled>移除所选（0）</button></div>
+          <ul id="source-list" class="source-list" aria-label="上传文件选择列表"></ul>
+          <p class="muted small">仅移出上传选择，本地原文件保留；已加入队列的任务请到“上传下载”页取消。</p>
+        </fieldset>
         <div class="spec-row"><span>单片上限 <b>80 MiB</b></span><span>自动建立目录</span><span>保留原始文件名</span></div>
         <div class="action-row"><p id="upload-hint" class="muted">请先登录并选择文件。</p><button id="start-upload" class="primary" disabled>切片并上传 <span data-icon="upload" aria-hidden="true"></span></button></div>
       </section>
@@ -75,24 +80,30 @@
             <div class="sync-form-actions"><button id="sync-cancel" type="button" class="text-button" hidden>取消编辑</button><button id="sync-save" class="primary" type="submit">保存规则</button></div>
           </form>
         </details>
-        <div class="sync-list-heading"><h3>同步规则</h3><span id="sync-count" class="muted small">0 条</span></div>
+        <div class="sync-list-heading"><h3>同步规则</h3><div><button id="show-sync-floating" class="text-button" disabled>显示同步浮窗</button><span id="sync-count" class="muted small">0 条</span></div></div>
         <div id="sync-rules" aria-label="同步规则列表"><p class="empty-state">登录后创建第一条同步规则</p></div>
       </section>
       <section id="settings-panel" class="panel operation-panel" hidden>
         <h2>设置与清理</h2>
-        <p class="muted small">目录设置自动保存，重新打开软件后继续使用。</p>
+        <p class="muted small">设置自动保存，重新打开软件后继续使用。</p>
         <p id="settings-warning" class="muted small" role="status" hidden></p>
+        <div class="setting-row"><div><h3>开机自启</h3><label class="checkbox"><input id="open-at-login" type="checkbox"> 登录 Windows 后自动启动</label><small id="startup-support-hint" class="muted">便携版移动位置后，请重新开启此项；系统启动应用也需要允许本软件。</small></div></div>
+        <div class="setting-row"><div><h3>静默启动</h3><label class="checkbox"><input id="start-hidden" type="checkbox"> 启动时只显示托盘图标</label><small class="muted">下次启动生效。点击托盘图标或再次打开软件可显示窗口；自动同步仍需有效的登录会话。</small></div></div>
+        <div class="setting-row"><div><h3>关闭到托盘</h3><label class="checkbox"><input id="close-to-tray" type="checkbox"> 点击关闭按钮时隐藏到托盘</label><small class="muted">后台上传、下载和同步继续运行。彻底退出请右键托盘图标，选择“退出软件”。</small></div></div>
         <div class="setting-row concurrency-setting"><div><h3>传输并发</h3><p class="muted small">多个切片同时上传或下载，每项可设 1–8 路。设置自动保存，供新任务和暂停后继续的任务使用。</p><small class="muted">运行中的任务保持原并发；实际路数不超过切片数。上传缓存约按并发路数增长。</small></div><div class="concurrency-fields"><label for="upload-concurrency">上传并发<select id="upload-concurrency"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select></label><label for="download-concurrency">下载并发<select id="download-concurrency"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select></label></div></div>
         <div class="setting-row"><div><h3>默认下载目录</h3><p id="setting-download-dir" class="setting-path"></p><small class="muted">合并后的原文件保存在这里；已创建任务保持原保存位置。</small></div><button id="set-download-dir" class="secondary">更改目录</button></div>
         <div class="setting-row"><div><h3>切片缓存目录</h3><p id="setting-cache-dir" class="setting-path"></p><small class="muted">新任务使用此位置。已有任务保留原缓存位置，可继续恢复。</small></div><button id="set-cache-dir" class="secondary">更改目录</button></div>
-        <div class="setting-row"><div><h3>自动清理缓存</h3><label class="checkbox"><input id="auto-clean-cache" type="checkbox" checked> 完成传输及校验后自动清理临时切片</label><small class="muted">启动时也会清理已完成任务的残留切片；暂停、失败和运行中的数据保留。</small></div></div>
-        <div class="setting-row"><div><h3>缓存管理</h3><p id="cache-status" class="muted small" role="status">点击刷新查看缓存占用。</p><small class="muted">仅清理本软件已完成任务的缓存，不删除原文件、合并结果或登录信息。</small></div><div class="setting-actions"><button id="refresh-cache" class="text-button">刷新占用</button><button id="clean-cache" class="secondary">清理缓存</button></div></div>
-        <div class="setting-row"><div><h3>历史记录</h3><p class="muted small">可清理已完成记录，或清空全部已结束历史（含失败记录及其恢复缓存）。运行和暂停任务、原文件与下载结果保留。</p></div><div class="setting-actions"><button id="clear-history-settings" class="secondary">清空已完成</button><button id="clear-all-history-settings" class="secondary">清空全部历史</button></div></div>
+        <div class="setting-row"><div><h3>自动清理缓存</h3><label class="checkbox"><input id="auto-clean-cache" type="checkbox" checked> 完成传输及校验后自动清理临时切片</label><small class="muted">启动时也会清理已完成或已取消任务的残留切片；暂停、失败和运行中的数据保留。</small></div></div>
+        <div class="setting-row"><div><h3>缓存管理</h3><p id="cache-status" class="muted small" role="status">点击刷新查看缓存占用。</p><small class="muted">仅清理本软件已完成或已取消任务的缓存，不删除原文件、合并结果或登录信息。</small></div><div class="setting-actions"><button id="refresh-cache" class="text-button">刷新占用</button><button id="clean-cache" class="secondary">清理缓存</button></div></div>
+        <div class="setting-row"><div><h3>历史记录</h3><p class="muted small">可清理已完成记录，或清空全部已结束历史（含失败、已取消记录及其恢复缓存）。运行和暂停任务、原文件与下载结果保留。</p></div><div class="setting-actions"><button id="clear-history-settings" class="secondary">清空已完成</button><button id="clear-all-history-settings" class="secondary">清空全部历史</button></div></div>
       </section>
       <section id="transfers-panel" class="panel operation-panel" hidden>
         <div class="transfer-heading"><div><h2>上传下载 <span id="task-count" class="task-count">0</span></h2><p id="transfer-summary" class="muted small">统一管理传输与历史记录</p></div><div class="setting-actions"><button id="show-floating" class="secondary" disabled>显示浮窗</button><button id="pause-all" class="secondary" disabled>暂停全部</button></div></div>
-        <div class="transfer-toolbar"><label for="transfer-type">类型<select id="transfer-type"><option value="all">全部类型</option><option value="upload">上传</option><option value="download">下载</option></select></label><label for="transfer-state">状态<select id="transfer-state"><option value="all">全部状态</option><option value="running">进行中</option><option value="queued">排队中</option><option value="paused">已暂停</option><option value="failed">失败</option><option value="completed">已完成</option></select></label><div class="transfer-clean"><button id="clear-history" class="text-button">清空已完成</button><button id="clear-all-history" class="secondary" title="清除已完成和失败记录及恢复缓存；运行和暂停任务保留">清空全部历史</button></div></div>
-        <p class="history-note muted">全部历史包含已完成和失败记录；运行、排队、暂停任务保留。清除失败记录后无法从原缓存继续。</p>
+        <div class="transfer-toolbar"><label for="transfer-type">类型<select id="transfer-type"><option value="all">全部类型</option><option value="upload">上传</option><option value="download">下载</option></select></label><label for="transfer-state">状态<select id="transfer-state"><option value="all">全部状态</option><option value="running">进行中</option><option value="queued">排队中</option><option value="paused">已暂停</option><option value="failed">失败</option><option value="completed">已完成</option><option value="canceled">已取消</option></select></label><div class="transfer-clean"><button id="clear-history" class="text-button">清空已完成</button><button id="clear-all-history" class="secondary" title="清除已完成、失败和已取消记录及恢复缓存；运行和暂停任务保留">清空全部历史</button></div></div>
+        <p class="history-note muted">全部历史包含已完成、失败和已取消记录；运行、排队、暂停任务保留。清除失败记录后无法从原缓存继续。</p>
+        <div class="task-selection"><label><input id="select-all-tasks" type="checkbox" aria-label="全选本页手动传输任务">本页全选</label><span id="task-selection-count" class="muted small" aria-live="polite">已选 0 项 · 可取消 0 项</span><button id="clear-task-selection" class="text-button" disabled>清除选择</button><button id="cancel-selected-tasks" class="secondary" disabled>取消所选（0）</button></div>
+        <p class="task-selection-hint muted small">Ctrl 点击增减选择 · Shift 连选 · Ctrl+Shift 追加范围（最多 200 项）。翻页保留选择；自动同步请在同步页管理。</p>
+        <nav id="task-pagination" class="task-pagination" aria-label="传输历史分页" hidden><button id="task-previous" class="secondary">上一页</button><span id="task-page-status" class="muted small" aria-live="polite"></span><button id="task-next" class="secondary">下一页</button></nav>
         <div id="tasks" tabindex="0" aria-label="上传下载任务"><div class="empty-state">暂无传输任务</div></div>
       </section>
       <footer>基于 YunX · AGPL-3.0 · 凭证仅保存在本机</footer>
@@ -115,6 +126,10 @@
   <aside id="floating-transfer" class="floating-transfer panel" aria-label="实时传输进度" hidden>
     <div class="floating-heading"><button id="floating-open" class="text-button">上传下载</button><span id="floating-state" class="task-status"></span><button id="floating-toggle" class="text-button" aria-label="收起传输浮窗" aria-expanded="true">收起</button><button id="floating-close" class="text-button" aria-label="隐藏传输浮窗" title="隐藏传输浮窗" data-icon="close"></button></div>
     <div class="floating-body"><button id="floating-name" class="floating-name" aria-label="打开当前任务所在文件夹"></button><div class="transfer-progress"><small id="floating-bytes"></small><progress id="floating-progress" max="1" aria-label="当前任务进度"></progress><span id="floating-percent">0%</span></div><div class="transfer-metrics"><div><small>速度</small><strong id="floating-speed">0.00 B/s</strong></div><div><small>已用时间</small><strong id="floating-elapsed">00:00:00</strong></div><div><small>预计剩余</small><strong id="floating-remaining">—</strong></div></div><div class="floating-actions"><p id="floating-message" class="floating-message"></p><button id="floating-folder" class="text-button">打开所在文件夹</button><button id="floating-action" class="text-button">暂停</button></div></div>
+  </aside>
+  <aside id="floating-sync" class="floating-transfer floating-sync panel" aria-label="自动同步整轮进度" hidden>
+    <div class="floating-heading"><button id="sync-floating-open" class="text-button">自动同步</button><span id="sync-floating-state" class="task-status"></span><button id="sync-floating-toggle" class="text-button" aria-label="收起同步浮窗" aria-expanded="true">收起</button><button id="sync-floating-close" class="text-button" aria-label="隐藏同步浮窗" data-icon="close"></button></div>
+    <div class="floating-body"><button id="sync-floating-name" class="floating-name" aria-label="查看当前同步规则"></button><div class="transfer-progress"><small id="sync-floating-bytes" title="整轮已处理 / 源文件总大小（包含跳过的文件）"></small><progress id="sync-floating-progress" max="1" aria-label="整轮同步进度"></progress><span id="sync-floating-percent">扫描中</span></div><div class="transfer-metrics"><div><small>上传速度</small><strong id="sync-floating-speed">0.00 B/s</strong></div><div><small>已用时间</small><strong id="sync-floating-elapsed">00:00:00</strong></div><div><small>预计剩余</small><strong id="sync-floating-remaining">—</strong></div></div><div class="floating-actions"><p id="sync-floating-message" class="floating-message"></p><button id="sync-floating-action" class="text-button">暂停规则</button></div></div>
   </aside>
 </body>
 </html>

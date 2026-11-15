@@ -1,10 +1,12 @@
 import { roundedBytes, duration } from './transfer-format.js';
 import { icon } from './icons.js';
-import { createSyncUI } from './sync.js';
+import { createSyncUI, syncActive, syncProgress } from './sync.js';
+import { setText } from './dom.js';
 for (const node of document.querySelectorAll('[data-icon]')) node.replaceChildren(icon(node.dataset.icon));
 const $ = id => document.getElementById(id);
 const api = window.lanzou;
-let state = { account: null, tasks: [] }, source = null, bundle = null, outputDir = '', noticeTimer;
+let state = { account: null, tasks: [] }, sources = [], bundle = null, outputDir = '', noticeTimer;
+const sourceRemovals = new Set();
 let history = [{ id: '-1', name: '根目录' }];
 let directoryFiles = [], directoryPage = 0, directoryHasMore = false, directoryBusy = false, directoryRequest = 0, bundleRequest = 0, selectingSource = false;
 let cloudDirty = false, cloudRevision = 0;
@@ -12,14 +14,23 @@ let recognitionRequest = 0, currentSlice = null, selectingBundle = false;
 let recognitionToken = null;
 const directorySnapshots = new Map();
 const taskRows = new Map();
+const TASK_PAGE_SIZE = 50;
+const selectedTasks = new Set();
+let taskSelectionAnchor = null, taskSelectionOrder = [], cancelSubmitting = false;
+let taskPage = 0, tasksDirty = true, directoryDirty = false, recognitionTimer = null;
+const directoryRows = new Map();
 let floatingId = null, floatingDismissed = null, floatingMinimized = false;
+let floatingSyncId = null, floatingSyncKey = null, floatingSyncDismissed = null;
 let managementTarget = null, managementBusy = false;
 const selectedDownloads = new Set();
 let selectionAnchor = null;
 let batchSubmitting = false;
-const statusText = task => ({ queued: '排队中', running: '进行中', paused: '已暂停', failed: '失败', completed: '已完成' }[task.state] || task.state);
+let uploadSubmitting = false, downloadSubmitting = false;
+const statusText = task => ({ queued: '排队中', running: '进行中', paused: '已暂停', failed: '失败', completed: '已完成', canceled: '已取消' }[task.state] || task.state);
+const canCancelTask = task => task && !task.syncRuleId && ['queued', 'running', 'paused', 'failed'].includes(task.state);
 const syncUI = createSyncUI({ api, run, notice, make, getState: () => state });
 const smartView = () => (state.settings?.browserView || 'smart') === 'smart';
+const syncFolder = file => file.isFolder ? state.sync?.rules.find(rule => String(rule.rootId) === String(file.id)) : null;
 const sizes = value => {
   if (!value) return '0 B';
   const i = Math.min(4, Math.floor(Math.log(value) / Math.log(1024)));
@@ -38,9 +49,11 @@ async function run(button, action) {
 }
 function updateControls() {
   const logged = Boolean(state.account); const running = state.sync?.busy || state.tasks.some(t => t.state === 'running');
-  $('start-upload').disabled = !logged || !source || running || managementBusy || batchSubmitting || state.tasks.some(task => task.state === 'queued');
-  $('start-download').disabled = !bundle || !outputDir || running || managementBusy;
-  $('upload-hint').textContent = running ? '当前有任务运行，可在右下角或“上传下载”页暂停。' : !logged ? '请先登录蓝奏云。' : !source ? '请选择需要上传的原始文件。' : '准备就绪，将自动创建云端文件夹。';
+  $('start-upload').disabled = !logged || !sources.length || uploadSubmitting || managementBusy || batchSubmitting;
+  $('choose-source').disabled = selectingSource || uploadSubmitting;
+  if ($('source-selection').disabled !== (selectingSource || uploadSubmitting)) $('source-selection').disabled = selectingSource || uploadSubmitting;
+  $('start-download').disabled = !bundle || !outputDir || downloadSubmitting || managementBusy;
+  $('upload-hint').textContent = !logged ? '请先登录蓝奏云；已选文件会保留。' : !sources.length ? '可多选或拖入文件，每次最多 200 个。' : running ? '可继续添加上传，任务将排队执行；可在“上传下载”页管理。' : `已选 ${sources.length} 个文件，将按顺序上传，每个文件单独建立云端目录。`;
   $('inspect-folder').disabled = !logged || history.at(-1).id === '-1';
   $('inspect-folder').disabled ||= directoryBusy || managementBusy;
   $('refresh-folders').disabled = !logged || directoryBusy || managementBusy;
@@ -49,15 +62,17 @@ function updateControls() {
   $('load-more').disabled = directoryBusy || managementBusy || !logged;
   $('load-more').hidden = !directoryHasMore;
   $('start-upload').disabled ||= selectingSource;
-  for (const button of $('folder-list').querySelectorAll('[data-download-slice],[data-download-file]')) button.disabled = directoryBusy || managementBusy || selectingBundle || running || !outputDir;
+  for (const button of $('folder-list').querySelectorAll('[data-download-slice],[data-download-file]')) button.disabled = directoryBusy || managementBusy || selectingBundle || batchSubmitting || !outputDir;
   const managementDisabled = directoryBusy || managementBusy || selectingBundle || batchSubmitting || !logged || state.sync?.busy;
   for (const button of $('folder-list').querySelectorAll('[data-cloud-manage]')) button.disabled = managementDisabled;
   if (managementDisabled) closeFileMenu();
   for (const id of ['clear-history', 'clear-history-settings']) $(id).disabled = !state.tasks.some(task => task.state === 'completed');
-  for (const id of ['clear-all-history', 'clear-all-history-settings']) $(id).disabled = !state.tasks.some(task => ['completed', 'failed'].includes(task.state));
+  for (const id of ['clear-all-history', 'clear-all-history-settings']) $(id).disabled = cancelSubmitting || !state.tasks.some(task => ['completed', 'failed', 'canceled'].includes(task.state));
   $('pause-all').disabled = !running && !state.tasks.some(task => task.state === 'queued');
   $('show-floating').disabled = !state.tasks.length;
+  $('show-sync-floating').disabled = !state.sync?.rules.some(rule => rule.progress);
   updateSelectionControls();
+  updateTaskSelectionControls();
 }
 function make(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = text; return node; }
 function taskMetrics(task) {
@@ -68,9 +83,69 @@ function updateTaskAction(task) {
   if (['paused', 'failed'].includes(task.state)) return api.call('resume', { id: task.id, password: $('share-password').value });
   return switchTab('transfers');
 }
+function resetTaskSelection() { selectedTasks.clear(); taskSelectionAnchor = null; }
+function selectTask(id, event = {}, checkbox = false) {
+  if (cancelSubmitting) return;
+  const additive = event.ctrlKey || event.metaKey, preserve = additive || checkbox && !event.shiftKey;
+  const next = new Set(preserve ? selectedTasks : []);
+  let ids = [id];
+  if (event.shiftKey) {
+    const from = taskSelectionOrder.indexOf(taskSelectionAnchor), to = taskSelectionOrder.indexOf(id);
+    if (from >= 0 && to >= 0) ids = taskSelectionOrder.slice(Math.min(from, to), Math.max(from, to) + 1);
+    else taskSelectionAnchor = id;
+  } else {
+    taskSelectionAnchor = id;
+    if ((checkbox || additive) && next.has(id)) { next.delete(id); ids = []; }
+  }
+  let limited = false;
+  for (const key of ids) {
+    if (next.size >= 200 && !next.has(key)) { limited = true; break; }
+    next.add(key);
+  }
+  selectedTasks.clear(); for (const key of next) selectedTasks.add(key);
+  if (limited) notice('每次最多选择 200 个任务，请分批操作');
+  updateTaskSelectionControls();
+}
+function updateTaskSelectionControls() {
+  for (const [id, row] of taskRows) {
+    row.checkbox.checked = selectedTasks.has(id); row.checkbox.disabled = cancelSubmitting || Boolean(row.task.syncRuleId);
+    row.root.classList.toggle('is-selected', row.checkbox.checked);
+    for (const button of row.buttons.querySelectorAll('[data-cancel-task]')) button.disabled = cancelSubmitting;
+  }
+  const rows = [...taskRows.values()].filter(row => !row.task.syncRuleId), checked = rows.filter(row => row.checkbox.checked).length;
+  const all = $('select-all-tasks'); all.checked = rows.length > 0 && checked === rows.length; all.indeterminate = checked > 0 && checked < rows.length; all.disabled = cancelSubmitting || !rows.length;
+  const cancellable = state.tasks.filter(task => selectedTasks.has(task.id) && canCancelTask(task)).length;
+  setText($('task-selection-count'), `已选 ${selectedTasks.size} 项 · 可取消 ${cancellable} 项`);
+  $('clear-task-selection').disabled = cancelSubmitting || !selectedTasks.size;
+  $('cancel-selected-tasks').disabled = cancelSubmitting || !cancellable;
+  setText($('cancel-selected-tasks'), cancelSubmitting ? '正在取消…' : `取消所选（${cancellable}）`);
+}
+async function cancelTasks(ids) {
+  if (cancelSubmitting) return;
+  const selected = new Set(ids), eligible = state.tasks.filter(task => selected.has(task.id) && canCancelTask(task)).map(task => task.id);
+  if (!eligible.length || !confirm(`取消 ${eligible.length} 个传输任务？\n停止后无法继续，任务临时缓存将清理。本地原文件、已完成下载和云端已上传内容保留。`)) return;
+  cancelSubmitting = true; updateTaskSelectionControls();
+  try {
+    const result = await api.call('cancel', { ids: eligible });
+    const failed = new Set(result.failures.map(item => item.id));
+    for (const id of eligible) if (!failed.has(id)) selectedTasks.delete(id);
+    render(await api.call('state'));
+    notice(`已取消 ${result.canceled} 项${result.skipped ? `，${result.skipped} 项已结束或不存在` : ''}${result.failures.length ? `；${result.failures.length} 项保存或缓存清理未完成：${result.failures[0].error}` : ''}`, Boolean(result.failures.length));
+  } finally { cancelSubmitting = false; updateTaskSelectionControls(); }
+}
 function createTaskRow(task) {
   const root = make('article', 'task'); root.dataset.taskId = task.id;
   const top = make('div', 'task-top'), title = make('div', 'task-name'), status = make('span', 'task-status');
+  const checkbox = make('input'); checkbox.type = 'checkbox'; checkbox.dataset.taskSelect = task.id; checkbox.setAttribute('aria-label', `选择任务 ${task.originalName || '文件任务'}`);
+  checkbox.title = task.syncRuleId ? '自动同步任务请到自动同步页面管理规则' : 'Ctrl 点击增减选择；Shift 连选；Ctrl+Shift 追加范围'; title.append(checkbox);
+  checkbox.addEventListener('change', () => selectTask(task.id, {}, true));
+  const selectionTarget = event => !task.syncRuleId && (!event.target.closest('button,input,a,select,textarea,details,[contenteditable="true"]') || event.target === checkbox);
+  root.addEventListener('mousedown', event => { if (event.button === 0 && event.shiftKey && selectionTarget(event)) event.preventDefault(); });
+  root.addEventListener('click', event => {
+    if (event.button !== 0 || !selectionTarget(event) || event.target === checkbox && !event.shiftKey) return;
+    event.preventDefault(); selectTask(task.id, event);
+    if (event.target === checkbox) requestAnimationFrame(updateTaskSelectionControls);
+  }, true);
   title.append(icon(task.type, 'ui-icon task-direction'), make('span', 'task-name-text', `${task.type === 'upload' ? '上传' : '下载'} · ${task.originalName || '文件任务'}`)); title.title = task.originalName || '文件任务'; top.append(title, status);
   const progressRow = make('div', 'transfer-progress'), progress = make('progress'), percent = make('span', 'task-percent'); progress.max = 1; progress.setAttribute('aria-label', `${task.originalName}进度`); progressRow.append(progress, percent);
   const detail = make('p', 'task-detail');
@@ -79,80 +154,133 @@ function createTaskRow(task) {
   const bottom = make('div', 'task-bottom'), info = make('small'), buttons = make('div', 'task-buttons'); bottom.append(info, buttons);
   const more = make('details', 'task-more'), metadata = make('div'); more.append(make('summary', '', '位置、分享与任务详情'), metadata);
   root.append(top, progressRow, detail, metrics, bottom, more);
-  return { root, status, progress, percent, detail, values, info, buttons, metadata, actionState: null, metadataKey: null };
+  return { root, checkbox, status, progress, percent, detail, values, info, buttons, metadata, actionState: null, metadataKey: null, task };
 }
 function renderTasks() {
-  const tasks = [...state.tasks].reverse(), ids = new Set(tasks.map(task => task.id));
+  tasksDirty = false;
+  const tasks = [...state.tasks].reverse();
+  const filtered = tasks.filter(task => ['all', task.type].includes($('transfer-type').value) && ['all', task.state].includes($('transfer-state').value));
+  taskSelectionOrder = filtered.filter(task => !task.syncRuleId).map(task => task.id);
+  const existing = new Set(tasks.map(task => task.id)); for (const id of selectedTasks) if (!existing.has(id)) selectedTasks.delete(id);
+  if (!existing.has(taskSelectionAnchor)) taskSelectionAnchor = null;
+  const pages = Math.max(1, Math.ceil(filtered.length / TASK_PAGE_SIZE)); taskPage = Math.min(taskPage, pages - 1);
+  const page = filtered.slice(taskPage * TASK_PAGE_SIZE, (taskPage + 1) * TASK_PAGE_SIZE), ids = new Set(page.map(task => task.id));
   for (const [id, row] of taskRows) if (!ids.has(id)) { row.root.remove(); taskRows.delete(id); }
   $('tasks').querySelector('.empty-state')?.remove();
-  const counts = type => state.tasks.filter(task => task.state === type).length;
-  $('task-count').textContent = String(tasks.length);
-  $('transfer-summary').textContent = `排队 ${counts('queued')} · 进行中 ${counts('running')} · 暂停 ${counts('paused')} · 失败 ${counts('failed')} · 已完成 ${counts('completed')}`;
-  let visible = 0;
-  for (const [index, task] of tasks.entries()) {
+  const counts = {}; for (const task of tasks) counts[task.state] = (counts[task.state] || 0) + 1;
+  setText($('task-count'), tasks.length);
+  setText($('transfer-summary'), `排队 ${counts.queued || 0} · 进行中 ${counts.running || 0} · 暂停 ${counts.paused || 0} · 失败 ${counts.failed || 0} · 已完成 ${counts.completed || 0} · 已取消 ${counts.canceled || 0}`);
+  setText($('task-page-status'), `第 ${taskPage + 1} / ${pages} 页 · 筛选结果 ${filtered.length} 项 · 每页 ${TASK_PAGE_SIZE} 项`);
+  $('task-previous').disabled = taskPage === 0; $('task-next').disabled = taskPage >= pages - 1;
+  $('task-pagination').hidden = filtered.length <= TASK_PAGE_SIZE;
+  for (const [index, task] of page.entries()) {
     let row = taskRows.get(task.id); if (!row) { row = createTaskRow(task); taskRows.set(task.id, row); }
+    row.task = task;
     if ($('tasks').children[index] !== row.root) $('tasks').insertBefore(row.root, $('tasks').children[index] || null);
-    row.root.hidden = !(['all', task.type].includes($('transfer-type').value) && ['all', task.state].includes($('transfer-state').value));
-    if (!row.root.hidden) visible++;
-    row.root.className = `task ${task.state}`;
-    row.status.className = `task-status ${task.state}`; row.status.textContent = statusText(task);
-    row.progress.value = Math.max(0, Math.min(1, task.progress || 0)); row.percent.textContent = `${Math.round(row.progress.value * 100)}%`;
-    row.detail.textContent = task.message || task.error || '准备中'; row.detail.title = row.detail.textContent;
-    taskMetrics(task).forEach((text, i) => { row.values[i].textContent = text; row.values[i].title = text; });
+    const className = `task ${task.state}${selectedTasks.has(task.id) ? ' is-selected' : ''}`; if (row.root.className !== className) row.root.className = className;
+    const statusClass = `task-status ${task.state}`; if (row.status.className !== statusClass) row.status.className = statusClass;
+    setText(row.status, statusText(task));
+    const ratio = Math.max(0, Math.min(1, task.progress || 0)); if (row.progress.value !== ratio) row.progress.value = ratio;
+    setText(row.percent, `${Math.round(ratio * 100)}%`);
+    setText(row.detail, task.message || task.error || '准备中'); if (row.detail.title !== row.detail.textContent) row.detail.title = row.detail.textContent;
+    taskMetrics(task).forEach((text, i) => { setText(row.values[i], text); if (row.values[i].title !== text) row.values[i].title = text; });
     const total = task.totalBytes || task.originalSize || 0;
-    row.info.textContent = `${roundedBytes(task.bytes || 0)} / ${task.downloadKind === 'file' && !task.totalKnown && task.state !== 'completed' ? '未知' : roundedBytes(total)} · ${task.downloadKind === 'file' ? '普通文件 · 单连接' : `${task.totalParts || 0} 片 · ${task.concurrency || 1} 路`}`;
+    setText(row.info, `${roundedBytes(task.bytes || 0)} / ${task.downloadKind === 'file' && !task.totalKnown && task.state !== 'completed' ? '未知' : roundedBytes(total)} · ${task.downloadKind === 'file' ? '普通文件 · 单连接' : `${task.totalParts || 0} 片 · ${task.concurrency || 1} 路`}`);
     if (row.actionState !== task.state) {
       row.actionState = task.state; row.buttons.replaceChildren();
-      const add = (text, action) => { const b = make('button', 'text-button', text); b.addEventListener('click', () => run(b, action)); row.buttons.append(b); };
-      if (['running', 'queued'].includes(task.state)) add('暂停', () => updateTaskAction(task));
-      if (['paused', 'failed'].includes(task.state)) add('继续', () => updateTaskAction(task));
+      const add = (text, action) => { const b = make('button', 'text-button', text); b.addEventListener('click', () => run(b, action)); row.buttons.append(b); return b; };
+      if (['running', 'queued'].includes(task.state)) add('暂停', () => updateTaskAction(row.task));
+      if (['paused', 'failed'].includes(task.state)) add('继续', () => updateTaskAction(row.task));
+      if (canCancelTask(task)) add('取消', () => cancelTasks([task.id])).dataset.cancelTask = task.id;
       add('打开所在文件夹', () => api.call('showResult', { id: task.id }));
       if (task.state === 'completed' && task.downloadKind !== 'file') add('导出清单', () => api.call('exportManifest', { id: task.id }));
-      if (['completed', 'failed'].includes(task.state)) add('移除记录', () => clearHistory('all', task.id));
+      if (['completed', 'failed', 'canceled'].includes(task.state)) add('移除记录', () => clearHistory('all', task.id));
     }
     const lines = [task.naming && `云端兼容目录：${task.naming.cloudFolderName}；原名保存在清单，下载时恢复。`, task.nameRestoration && !task.nameRestoration.exact && `实际保存名：${task.savedName}；完整原名保留在清单。`, task.outputDir && `下载目录：${task.outputDir}`, task.cachePath && `缓存目录：${task.cachePath}`, task.share?.url && `文件夹分享：${task.share.url}${task.share.password ? ` 提取码：${task.share.password}` : ''}`, task.shareWarning, task.indexWarning].filter(Boolean);
     const key = lines.join('\n'); if (row.metadataKey !== key) { row.metadataKey = key; row.metadata.replaceChildren(...lines.map(text => make('p', 'task-detail', text))); }
   }
-  if (!visible) $('tasks').append(make('div', 'empty-state', tasks.length ? '没有符合筛选条件的任务' : '暂无传输任务'));
-  renderFloating();
+  if (!page.length) $('tasks').append(make('div', 'empty-state', tasks.length ? '没有符合筛选条件的任务' : '暂无传输任务'));
+  updateTaskSelectionControls();
 }
 function renderFloating() {
-  const task = state.tasks.find(task => task.state === 'running') || state.tasks.find(task => task.id === floatingId) || state.tasks.at(-1);
+  if (document.hidden) return;
+  const manual = state.tasks.filter(task => !task.syncRuleId), running = manual.find(task => task.state === 'running');
+  const latestManual = Math.max(0, ...manual.map(task => Date.parse(task.lastStoppedAt || task.createdAt) || 0));
+  const rules = state.sync?.rules || [], rule = rules.find(syncActive) || (!running && rules.filter(rule => rule.progress && (rule.lastFinished || 0) >= latestManual).sort((a, b) => (b.lastRun || 0) - (a.lastRun || 0))[0]);
+  $('floating-sync').hidden = true;
+  if (rule) { $('floating-transfer').hidden = true; renderSyncFloating(rule); return; }
+  floatingSyncId = null;
+  const task = running || manual.find(task => task.id === floatingId) || manual.at(-1);
   if (!task) { floatingId = null; $('floating-transfer').hidden = true; return; }
   if (floatingId !== task.id) { floatingId = task.id; floatingDismissed = null; }
   const panel = $('floating-transfer'); panel.hidden = floatingDismissed === task.id; panel.classList.toggle('minimized', floatingMinimized);
-  $('floating-toggle').textContent = floatingMinimized ? '展开' : '收起'; $('floating-toggle').setAttribute('aria-expanded', String(!floatingMinimized)); $('floating-toggle').setAttribute('aria-label', floatingMinimized ? '展开传输浮窗' : '收起传输浮窗');
-  $('floating-state').textContent = `${task.type === 'upload' ? '上传' : '下载'} · ${statusText(task)}`; $('floating-state').className = `task-status ${task.state}`;
-  $('floating-name').textContent = task.originalName || '文件任务'; $('floating-name').title = `${task.originalName || '文件任务'} — 点击打开所在文件夹`;
-  $('floating-progress').value = Math.max(0, Math.min(1, task.progress || 0)); $('floating-percent').textContent = `${Math.round($('floating-progress').value * 100)}%`;
-  $('floating-message').textContent = task.message || '准备中'; $('floating-message').title = task.message || '';
-  const values = taskMetrics(task); ['speed', 'elapsed', 'remaining'].forEach((key, i) => { $('floating-' + key).textContent = values[i]; $('floating-' + key).title = values[i]; });
-  $('floating-bytes').textContent = `${roundedBytes(task.bytes || 0)} / ${task.downloadKind === 'file' && !task.totalKnown && task.state !== 'completed' ? '未知' : roundedBytes(task.totalBytes || task.originalSize || 0)}`;
-  $('floating-action').textContent = ['running', 'queued'].includes(task.state) ? '暂停' : ['paused', 'failed'].includes(task.state) ? '继续' : '查看任务';
+  if (panel.hidden) return;
+  setText($('floating-toggle'), floatingMinimized ? '展开' : '收起');
+  if ($('floating-toggle').getAttribute('aria-expanded') !== String(!floatingMinimized)) { $('floating-toggle').setAttribute('aria-expanded', String(!floatingMinimized)); $('floating-toggle').setAttribute('aria-label', floatingMinimized ? '展开传输浮窗' : '收起传输浮窗'); }
+  setText($('floating-state'), `${task.type === 'upload' ? '上传' : '下载'} · ${statusText(task)}`);
+  const statusClass = `task-status ${task.state}`; if ($('floating-state').className !== statusClass) $('floating-state').className = statusClass;
+  setText($('floating-name'), task.originalName || '文件任务');
+  const title = `${task.originalName || '文件任务'} — 点击打开所在文件夹`; if ($('floating-name').title !== title) $('floating-name').title = title;
+  if (floatingMinimized) return;
+  const ratio = Math.max(0, Math.min(1, task.progress || 0)); if ($('floating-progress').value !== ratio) $('floating-progress').value = ratio;
+  setText($('floating-percent'), `${Math.round(ratio * 100)}%`);
+  setText($('floating-message'), task.message || '准备中'); if ($('floating-message').title !== (task.message || '')) $('floating-message').title = task.message || '';
+  const values = taskMetrics(task); ['speed', 'elapsed', 'remaining'].forEach((key, i) => { setText($('floating-' + key), values[i]); if ($('floating-' + key).title !== values[i]) $('floating-' + key).title = values[i]; });
+  setText($('floating-bytes'), `${roundedBytes(task.bytes || 0)} / ${task.downloadKind === 'file' && !task.totalKnown && task.state !== 'completed' ? '未知' : roundedBytes(task.totalBytes || task.originalSize || 0)}`);
+  setText($('floating-action'), ['running', 'queued'].includes(task.state) ? '暂停' : ['paused', 'failed'].includes(task.state) ? '继续' : '查看任务');
+}
+function renderSyncFloating(rule) {
+  floatingSyncId = rule.id;
+  const key = `${rule.id}:${rule.lastRun}`;
+  if (key !== floatingSyncKey) { floatingSyncKey = key; floatingSyncDismissed = null; }
+  const panel = $('floating-sync'), values = syncProgress(rule); panel.hidden = floatingSyncDismissed === key; panel.classList.toggle('minimized', floatingMinimized);
+  if (panel.hidden || document.hidden) return;
+  setText($('sync-floating-toggle'), floatingMinimized ? '展开' : '收起');
+  if ($('sync-floating-toggle').getAttribute('aria-expanded') !== String(!floatingMinimized)) $('sync-floating-toggle').setAttribute('aria-expanded', String(!floatingMinimized));
+  setText($('sync-floating-state'), ({ scanning: '扫描比对', uploading: '同步上传', cleaning: '清理旧版', paused: '已暂停', error: '同步失败', queued: '等待空闲' }[rule.state] || (rule.progress?.finished ? '本轮完成' : '等待计划')));
+  const statusClass = `task-status ${rule.state === 'error' ? 'failed' : syncActive(rule) ? 'running' : rule.progress?.finished ? 'completed' : 'paused'}`;
+  if ($('sync-floating-state').className !== statusClass) $('sync-floating-state').className = statusClass;
+  setText($('sync-floating-name'), rule.name); if ($('sync-floating-name').title !== rule.sourcePath) $('sync-floating-name').title = rule.sourcePath;
+  if (floatingMinimized) return;
+  if (values.known) { if ($('sync-floating-progress').value !== values.ratio) $('sync-floating-progress').value = values.ratio; } else if ($('sync-floating-progress').hasAttribute('value')) $('sync-floating-progress').removeAttribute('value');
+  for (const key of ['percent', 'bytes', 'speed', 'elapsed', 'remaining']) setText($('sync-floating-' + key), values[key]);
+  setText($('sync-floating-message'), `${values.detail} · ${values.message}`); if ($('sync-floating-message').title !== $('sync-floating-message').textContent) $('sync-floating-message').title = $('sync-floating-message').textContent;
+  setText($('sync-floating-action'), syncActive(rule) || rule.state === 'queued' ? '暂停规则' : ['paused', 'error'].includes(rule.state) ? '继续同步' : '查看规则');
 }
 function render(next) {
+  const syncFolders = value => JSON.stringify(value.sync?.rules.map(rule => [rule.id, rule.rootId, rule.name, rule.managedFiles]));
+  const changedSync = syncFolders(state) !== syncFolders(next);
   const changedView = (state.settings?.browserView || 'smart') !== (next.settings?.browserView || 'smart');
   const changedAccount = (state.account?.uid || state.account?.label) !== (next.account?.uid || next.account?.label);
-  if (next.tasks.some(task => task.type === 'upload' && task.state === 'completed' && !state.tasks.some(previous => previous.id === task.id && previous.state === 'completed'))) { cloudDirty = true; cloudRevision++; }
+  const changedSettings = JSON.stringify([state.settings, state.settingsWarning, state.startupSupported]) !== JSON.stringify([next.settings, next.settingsWarning, next.startupSupported]);
+  const taskStates = value => value.tasks.map(task => `${task.id}:${task.state}`).join('|');
+  const changedControls = changedAccount || changedSettings || taskStates(state) !== taskStates(next) || Boolean(state.sync?.busy) !== Boolean(next.sync?.busy);
+  const completed = new Set(state.tasks.filter(task => task.state === 'completed').map(task => task.id));
+  if (next.tasks.some(task => task.type === 'upload' && task.state === 'completed' && !completed.has(task.id))) { cloudDirty = true; cloudRevision++; }
   state = next;
   syncUI.render(state);
-  if (state.settings) {
+  if (state.settings && changedSettings) {
     outputDir = state.settings.downloadDir;
     $('output-directory').textContent = outputDir; $('output-directory').title = outputDir;
     $('setting-download-dir').textContent = outputDir;
     $('setting-cache-dir').textContent = state.settings.cacheDir;
     $('auto-clean-cache').checked = state.settings.autoCleanCache;
+    for (const [id, key] of [['open-at-login', 'openAtLogin'], ['start-hidden', 'startHidden'], ['close-to-tray', 'closeToTray']]) $(id).checked = Boolean(state.settings[key]);
+    $('open-at-login').disabled = !state.startupSupported;
+    setText($('startup-support-hint'), state.startupSupported ? '便携版移动位置后，请重新开启此项；系统启动应用也需要允许本软件。' : '开机自启仅支持 Windows 便携成品版，开发运行不会注册系统启动项。');
     $('upload-concurrency').value = String(state.settings.uploadConcurrency);
     $('download-concurrency').value = $('concurrency').value = String(state.settings.downloadConcurrency);
     $('upload-concurrency-label').textContent = `上传并发 ${state.settings.uploadConcurrency} 路`;
     $('settings-warning').textContent = state.settingsWarning || ''; $('settings-warning').hidden = !state.settingsWarning;
   }
-  for (const mode of ['raw', 'smart']) { $('view-' + mode).classList.toggle('selected', smartView() === (mode === 'smart')); $('view-' + mode).setAttribute('aria-pressed', String(smartView() === (mode === 'smart'))); }
+  if (changedView || changedSettings) for (const mode of ['raw', 'smart']) { $('view-' + mode).classList.toggle('selected', smartView() === (mode === 'smart')); $('view-' + mode).setAttribute('aria-pressed', String(smartView() === (mode === 'smart'))); }
   if (changedAccount) {
+    resetTaskSelection();
     resetDownloadSelection();
     if ($('cloud-dialog').open) { managementTarget = null; $('cloud-dialog').close(); }
     closeFileMenu();
-    directorySnapshots.clear(); recognitionToken = null;
+    directorySnapshots.clear(); directoryRows.clear(); recognitionToken = null;
+    clearTimeout(recognitionTimer); recognitionTimer = null; directoryDirty = false;
     recognitionRequest++; currentSlice = null;
     directoryRequest++; directoryBusy = false; directoryFiles = []; directoryPage = 0; directoryHasMore = false;
     history = [{ id: '-1', name: '根目录' }]; clearBundle();
@@ -161,28 +289,31 @@ function render(next) {
     $('folder-list').replaceChildren(make('p', 'muted', state.account ? '点击“刷新目录”读取文件。' : '登录后点击“刷新目录”。'));
     $('folder-list').setAttribute('aria-busy', 'false');
   }
-  $('app-version').textContent = `v${state.version}`;
+  setText($('app-version'), `v${state.version}`);
   const restoreWindow = state.windowState?.maximized || state.windowState?.fullscreen;
   const maximizeButton = $('window-maximize'), windowAction = restoreWindow ? '还原' : '最大化';
-  maximizeButton.title = windowAction; maximizeButton.setAttribute('aria-label', windowAction);
+  if (maximizeButton.title !== windowAction) { maximizeButton.title = windowAction; maximizeButton.setAttribute('aria-label', windowAction); }
   if (maximizeButton.dataset.icon !== (restoreWindow ? 'restore' : 'maximize')) {
     maximizeButton.dataset.icon = restoreWindow ? 'restore' : 'maximize';
     maximizeButton.replaceChildren(icon(maximizeButton.dataset.icon));
   }
   if (changedAccount) $('account-options').open = !state.account;
-  $('account-status').textContent = state.account ? `已登录 · ${state.account.label}` : '未登录';
+  setText($('account-status'), state.account ? `已登录 · ${state.account.label}` : '未登录');
   $('account-status').classList.toggle('connected', Boolean(state.account));
   $('remember').disabled = !state.encryptionAvailable;
   if (!state.encryptionAvailable) $('remember').checked = false;
   $('login-form').hidden = Boolean(state.account); $('logout').hidden = !state.account;
-  renderTasks();
+  tasksDirty = true;
+  if (!$('transfers-panel').hidden && !document.hidden) renderTasks();
+  renderFloating();
   if (changedView && !changedAccount) {
     resetDownloadSelection();
     recognitionRequest++; clearBundle();
     if (directoryPage) renderDirectory(true);
     if (smartView() && !directoryBusy && directoryPage) void identifyFolders(directoryRequest);
   }
-  updateControls();
+  if (changedSync && !changedAccount && !changedView && directoryPage) renderDirectory(true);
+  if (changedControls) updateControls();
   refreshUploadedFiles();
 }
 function refreshUploadedFiles() {
@@ -195,6 +326,9 @@ function switchTab(name) {
     $(`tab-${item}`).classList.toggle('active', item === name);
     $(`tab-${item}`).setAttribute('aria-selected', String(item === name));
   }
+  if (name === 'transfers' && tasksDirty) renderTasks();
+  if (name === 'sync') syncUI.render(state);
+  if (name === 'download' && directoryDirty) renderDirectory(true);
   if (name === 'download' && state.account && (!directoryPage || cloudDirty) && !directoryBusy) void run(null, () => refreshFolders(cloudDirty ? [{ id: '-1', name: '根目录' }] : history));
   if (name === 'settings') void run(null, refreshCache);
 }
@@ -207,7 +341,7 @@ function showBundle(value) {
 function clearBundle() { bundleRequest++; bundle = null; $('bundle-summary').hidden = true; updateControls(); }
 function fileIcon(kind) { return icon(kind, `entry-icon ${kind}`); }
 function selectionKey(file) { return `${file.isFolder ? 'folder' : 'file'}:${file.id}`; }
-function downloadable(file) { return !file.isFolder || Boolean(smartView() && file.slice); }
+function downloadable(file) { return !file.isFolder || Boolean(smartView() && file.slice && !syncFolder(file)); }
 function resetDownloadSelection() { selectedDownloads.clear(); selectionAnchor = null; }
 function browserEntries() {
   let entries = directoryFiles;
@@ -243,7 +377,7 @@ function selectDownload(file, event = {}, checkbox = false) {
   updateSelectionControls();
 }
 function updateSelectionControls() {
-  const busy = batchSubmitting || directoryBusy || managementBusy || selectingBundle || state.sync?.busy;
+  const busy = batchSubmitting || directoryBusy || managementBusy || selectingBundle;
   const boxes = [...$('folder-list').querySelectorAll('[data-download-select]')];
   for (const box of boxes) {
     box.checked = selectedDownloads.has(box.dataset.downloadSelect); box.disabled = busy;
@@ -271,13 +405,18 @@ async function downloadSelected() {
   } finally { batchSubmitting = false; updateControls(); }
 }
 function renderDirectory(append = false) {
+  if ($('download-panel').hidden || $('account-browser').hidden || document.hidden) { directoryDirty = true; return; }
+  directoryDirty = false; clearTimeout(recognitionTimer); recognitionTimer = null;
   closeFileMenu();
   if (directoryPage === 1 && state.account) {
     directorySnapshots.set(history.at(-1).id, { entries: directoryFiles.map(file => ({ ...file })), hasMore: directoryHasMore, time: Date.now() });
     while (directorySnapshots.size > 32) directorySnapshots.delete(directorySnapshots.keys().next().value);
   }
   const scrollTop = append ? $('folder-list').scrollTop : 0;
-  const table = make('table', 'file-table'); table.setAttribute('aria-label', '云端文件');
+  let table = $('folder-list').querySelector('.file-table');
+  const existingTable = Boolean(table);
+  if (!table) { table = make('table', 'file-table'); table.setAttribute('aria-label', '云端文件'); }
+  if (!existingTable) {
   const head = table.createTHead().insertRow();
   for (const text of ['名称','大小','修改时间','操作']) { const cell = make('th', '', text); cell.scope = 'col'; head.append(cell); }
   const all = make('input'); all.type = 'checkbox'; all.id = 'select-all-downloads'; all.setAttribute('aria-label', '全选已加载的文件和文件夹'); all.title = '全选已加载的项目，每批最多 200 项；普通文件夹可选择管理，不递归下载';
@@ -288,18 +427,29 @@ function renderDirectory(append = false) {
     if (all.checked) { for (const file of eligible.slice(0, 200)) selectedDownloads.add(selectionKey(file)); if (eligible.length > 200) notice('每批最多 200 项，已选择前 200 项，其余请分批操作'); clearBundle(); }
     updateSelectionControls();
   });
-  const body = table.createTBody();
+  }
+  const body = table.tBodies[0] || table.createTBody();
   const entries = browserEntries(), eligibleKeys = new Set(entries.map(selectionKey));
+  for (const [key, cached] of directoryRows) if (!eligibleKeys.has(key)) { cached.row.remove(); directoryRows.delete(key); }
   for (const key of selectedDownloads) if (!eligibleKeys.has(key)) selectedDownloads.delete(key);
   if (!eligibleKeys.has(selectionAnchor)) selectionAnchor = null;
-  for (const file of entries) {
+  for (const [index, file] of entries.entries()) {
+    const key = selectionKey(file), syncRule = smartView() ? syncFolder(file) : null;
+    const signature = JSON.stringify([file, smartView(), syncRule && [syncRule.name, syncRule.managedFiles]]);
+    const cached = directoryRows.get(key);
+    if (cached?.file === file && cached.signature === signature) {
+      if (body.children[index] !== cached.row) body.insertBefore(cached.row, body.children[index] || null);
+      continue;
+    }
+    cached?.row.remove();
     const row = make('tr', 'folder-row');
     row.dataset.entryId = file.id; row.dataset.entryKind = file.isFolder ? 'folder' : 'file';
     const name = make('td', 'file-name'), label = make('div', 'file-label');
-    const slice = smartView() ? file.slice : null;
+    const sync = smartView() ? syncFolder(file) : null;
+    const slice = smartView() && !sync ? file.slice : null;
     const kind = slice ? 'slice' : file.isFolder ? 'folder' : file.name === 'manifest.lanzou.txt' ? 'manifest' : /\.(zip|rar|7z)$/i.test(file.name) ? 'archive' : 'file';
-    const displayName = slice?.originalName || file.name;
-    const text = make(slice ? 'button' : 'span', `file-name-text${slice ? ' slice-name' : ''}`, displayName); text.title = slice ? `${displayName}\n云端目录：${file.name}\n${slice.totalParts} 个切片；点击查看详情` : file.name;
+    const displayName = sync?.name || slice?.originalName || file.name;
+    const text = make(slice ? 'button' : 'span', `file-name-text${slice ? ' slice-name' : ''}`, displayName); text.title = sync ? `${displayName}\n自动同步目录：${file.name}\n双击进入` : slice ? `${displayName}\n云端目录：${file.name}\n${slice.totalParts} 个切片；点击查看详情` : file.name;
     if (slice) text.addEventListener('click', () => run(text, () => selectSlice(file)));
     const checkbox = make('input'); checkbox.type = 'checkbox'; checkbox.setAttribute('aria-label', `选择 ${displayName}`);
     {
@@ -324,10 +474,13 @@ function renderDirectory(append = false) {
       }, true);
     }
     label.append(checkbox, fileIcon(kind), text); name.append(label);
-    if (slice) {
+    if (sync) {
+      label.append(make('span', 'slice-badge', '自动同步'));
+      name.append(make('small', 'slice-caption', `${sync.managedFiles} 个同步文件 · 云端目录：${file.name}`)); row.classList.add('sync-folder');
+    } else if (slice) {
       const preview = slice.status === 'preview';
       label.append(make('span', 'slice-badge', preview ? '快速预览' : '切片文件'));
-      const caption = make('small', 'slice-caption', `${slice.cached ? (slice.stale ? '缓存预览，后台更新 · ' : '缓存预览 · ') : ''}${preview ? '下载前校验 · ' : ''}${slice.totalParts} 片 · 云端目录：${file.name}`); caption.title = caption.textContent; name.append(caption); row.classList.add('slice-folder');
+      const caption = make('small', 'slice-caption', `${slice.cached ? (slice.stale ? '缓存预览，待复核 · ' : '缓存预览 · ') : ''}${slice.message ? `更新未完成：${slice.message} · ` : ''}${preview ? '下载前校验 · ' : ''}${slice.totalParts} 片 · 云端目录：${file.name}`); caption.title = caption.textContent; name.append(caption); row.classList.add('slice-folder');
     } else if (smartView() && file.isFolder && file.identification === 'unavailable') {
       const note = make('small', 'slice-caption recognition-error', `识别失败：${file.identificationMessage || '请重试'}`); note.title = note.textContent; name.append(note);
     } else if (smartView() && file.isFolder && file.identification === 'ordinary') name.append(make('small', 'slice-caption', '普通文件夹'));
@@ -337,15 +490,24 @@ function renderDirectory(append = false) {
     if (file.isFolder) {
       const button = make('button', 'text-button', slice ? '查看切片' : '进入');
       button.setAttribute('aria-label', `进入 ${displayName}`);
-      button.addEventListener('click', () => run(button, async () => {
+      const enterFolder = async () => {
+        if (directoryBusy || managementBusy || batchSubmitting) return;
         if (slice) await setBrowserView('raw');
         if (!file.isCurrentSlice) await refreshFolders([...history, { id: file.id, name: displayName, cloudName: file.name }]);
-      })); button.disabled = directoryBusy; actions.append(button);
+      };
+      button.addEventListener('click', () => run(button, enterFolder));
+      row.addEventListener('dblclick', event => {
+        if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
+        const control = event.target.closest('button,input,a,select,textarea,summary,[contenteditable="true"]');
+        if (control && control !== text) return;
+        event.preventDefault(); void run(null, enterFolder);
+      });
+      button.disabled = directoryBusy; actions.append(button);
       if (slice) {
         const select = make('button', 'text-button select-download', '下载并合并'); select.dataset.downloadSlice = 'true';
         select.setAttribute('aria-label', `下载并合并 ${displayName}`);
         select.addEventListener('click', () => run(select, () => selectSlice(file, true))); actions.append(select);
-      } else if (smartView() && file.identification === 'unavailable') {
+      } else if (!sync && smartView() && file.identification === 'unavailable') {
         const retry = make('button', 'text-button', '重试识别'); retry.disabled = directoryBusy;
         retry.addEventListener('click', () => run(retry, async () => { delete file.identification; await identifyFolders(directoryRequest, true); })); actions.append(retry);
       }
@@ -368,9 +530,11 @@ function renderDirectory(append = false) {
       if (!selectedDownloads.has(selectionKey(file))) selectDownload(file);
       openFileMenu(more, file, event);
     });
-    body.append(row);
+    body.insertBefore(row, body.children[index] || null);
+    directoryRows.set(key, { row, file, signature });
   }
-  $('folder-list').replaceChildren(entries.length ? table : make('p', 'muted', '此目录为空。'));
+  if (!entries.length) { $('folder-list').replaceChildren(make('p', 'muted', '此目录为空。')); directoryRows.clear(); }
+  else if (!existingTable) $('folder-list').replaceChildren(table);
   $('folder-list').scrollTop = scrollTop;
   $('folder-path').textContent = history.map(h => smartView() ? h.name : h.cloudName || h.name).join(' / '); $('folder-path').title = $('folder-path').textContent; updateControls();
   const folders = entries.filter(file => file.isFolder && !(smartView() && file.slice)).length;
@@ -498,7 +662,7 @@ async function submitCloudChange(event) {
 async function downloadRegular(file) {
   if (selectingBundle) return;
   selectingBundle = true; clearBundle(); updateControls();
-  try { await api.call('downloadFile', { id: file.id, parentId: history.at(-1).id }); notice('普通文件下载已开始，可在右下角或“上传下载”页管理'); }
+  try { await api.call('downloadFile', { id: file.id, parentId: history.at(-1).id }); notice('普通文件下载已加入传输队列，可在“上传下载”页管理'); }
   finally { selectingBundle = false; updateControls(); }
 }
 async function selectSlice(file, download = false) {
@@ -508,7 +672,7 @@ async function selectSlice(file, download = false) {
     const value = await api.call('inspectFolder', { folderId: file.id });
     if (request !== bundleRequest || directory !== directoryRequest) return;
     showBundle(value);
-    if (download) { await api.call('download', { key: value.key, outputDir, concurrency: Number($('concurrency').value) }); notice('下载已开始，完成后自动校验并合并为原文件'); }
+    if (download) { await api.call('download', { key: value.key, outputDir, concurrency: Number($('concurrency').value) }); notice('下载已加入传输队列，完成后自动校验并合并为原文件'); }
   } catch (error) {
     if (request === bundleRequest && directory === directoryRequest) { delete file.slice; file.identification = 'unavailable'; file.identificationMessage = error.message; renderDirectory(true); }
     throw error;
@@ -545,7 +709,7 @@ async function refreshFolders(nextHistory = history, append = false, force = fal
     if (target.at(-1).id === '-1' && revision === cloudRevision) cloudDirty = false;
     succeeded = true;
     renderDirectory(append);
-    if (smartView()) void identifyFolders(request, force);
+    if (smartView()) void identifyFolders(request);
   } catch (error) {
     if (request !== directoryRequest) return;
     if (showedSnapshot) {
@@ -564,14 +728,15 @@ async function refreshFolders(nextHistory = history, append = false, force = fal
 }
 function recognitionSummary(pending = 0) {
   const recognized = directoryFiles.filter(file => file.slice).length + Number(Boolean(currentSlice));
-  const ordinary = directoryFiles.filter(file => file.isFolder && file.identification === 'ordinary').length;
-  const failed = directoryFiles.filter(file => file.identification === 'unavailable').length;
-  $('recognition-status').textContent = `切片 ${recognized} · 文件夹 ${ordinary}${pending ? ` · 待识别 ${pending}` : ''}${failed ? ` · 失败 ${failed}` : ''}`;
-  $('recognition-status').title = '已知原名从本机账号缓存即时显示；首次遇到的目录在后台逐项识别。普通文件夹正常进入。刷新目录可强制重新识别；下载前始终重新校验完整清单。';
+  const synced = directoryFiles.filter(syncFolder).length;
+  const ordinary = directoryFiles.filter(file => file.isFolder && !syncFolder(file) && file.identification === 'ordinary').length;
+  const failed = directoryFiles.filter(file => !syncFolder(file) && file.identification === 'unavailable').length;
+  $('recognition-status').textContent = `切片 ${recognized} · 文件夹 ${ordinary}${synced ? ` · 同步目录 ${synced}` : ''}${pending ? ` · 待识别 ${pending}` : ''}${failed ? ` · 失败 ${failed}` : ''}`;
+  $('recognition-status').title = '刷新目录保留已知原名；切片预览 5 分钟、普通目录 1 分钟内复用，过期后后台复核。单个目录识别最多等待 12 秒，临时网络失败保留预览；下载前始终重新校验完整清单。';
 }
 function applyRecognition(result) {
   const file = directoryFiles.find(file => file.isFolder && String(file.id) === result.id);
-  if (!file) return;
+  if (!file || syncFolder(file)) return;
   file.identification = result.status; file.identificationMessage = result.message; file.recognitionStale = Boolean(result.stale);
   if (['ready', 'preview'].includes(result.status)) file.slice = result;
   else delete file.slice;
@@ -579,13 +744,18 @@ function applyRecognition(result) {
 api.onRecognition(({ token, ownerUid, result }) => {
   if (!recognitionToken || token !== recognitionToken.token || String(ownerUid) !== String(state.account?.uid) || recognitionToken.request !== directoryRequest || recognitionToken.recognition !== recognitionRequest || !smartView()) return;
   applyRecognition(result); recognitionToken.pending.delete(result.id);
-  renderDirectory(true); recognitionSummary(recognitionToken.pending.size);
+  scheduleRecognitionRender();
 });
-async function identifyFolders(request, force = false) {
+function scheduleRecognitionRender() {
+  directoryDirty = true;
+  if (recognitionTimer || $('download-panel').hidden || $('account-browser').hidden || document.hidden) return;
+  recognitionTimer = setTimeout(() => { recognitionTimer = null; renderDirectory(true); recognitionSummary(recognitionToken?.pending.size || 0); }, 100);
+}
+async function identifyFolders(request) {
   if (!smartView() || request !== directoryRequest) return;
   const recognition = ++recognitionRequest;
   const valid = () => smartView() && request === directoryRequest && recognition === recognitionRequest;
-  const folders = directoryFiles.filter(file => file.isFolder && (!file.identification || file.recognitionStale));
+  const folders = directoryFiles.filter(file => file.isFolder && !syncFolder(file) && (!file.identification || file.recognitionStale));
   recognitionToken = { token: `${request}:${recognition}`, request, recognition, pending: new Set(folders.map(file => String(file.id))) };
   const token = recognitionToken.token;
   recognitionSummary(folders.length);
@@ -599,12 +769,12 @@ async function identifyFolders(request, force = false) {
     for (let offset = 0; offset < folders.length; offset += 256) {
       if (!valid()) return;
       const batch = folders.slice(offset, offset + 256);
-      const results = await api.call('identifyFolders', { folderIds: batch.map(file => file.id), folderNames: Object.fromEntries(batch.map(file => [file.id, file.name])), token, force });
+      const results = await api.call('identifyFolders', { folderIds: batch.map(file => file.id), folderNames: Object.fromEntries(batch.map(file => [file.id, file.name])), token });
       if (!valid()) return;
       for (const result of results) {
         applyRecognition(result); recognitionToken.pending.delete(result.id);
       }
-      renderDirectory(true);
+      scheduleRecognitionRender();
     }
     if (valid()) {
       recognitionSummary();
@@ -626,12 +796,45 @@ async function inspectCurrentFolder() {
   if (request === bundleRequest) showBundle(value);
 }
 function setSource(selected) {
-  source = selected; $('source-name').textContent = selected.name; $('source-path').textContent = selected.path;
-  $('choose-source').classList.add('has-file'); $('source-name').title = selected.name; $('source-path').title = selected.path;
-  $('source-size').textContent = sizes(selected.size); $('source-size').hidden = false; updateControls();
+  sources = Array.isArray(selected) ? selected : [selected];
+  sourceRemovals.clear();
+  const name = !sources.length ? '多选文件，或批量拖到这里' : sources.length === 1 ? sources[0].name : `已选择 ${sources.length} 个文件`;
+  const paths = sources.map(file => file.path).join('；');
+  $('source-name').textContent = name; $('source-name').title = sources.map(file => file.name).join('；');
+  $('source-path').textContent = paths || '每次最多 200 个；登录后拖入即排队上传'; $('source-path').title = paths;
+  $('choose-source').classList.toggle('has-file', Boolean(sources.length));
+  $('source-size').textContent = `${sources.length > 1 ? '合计 ' : ''}${sizes(sources.reduce((sum, file) => sum + file.size, 0))}`; $('source-size').hidden = !sources.length;
+  const rows = document.createDocumentFragment();
+  for (const file of sources) {
+    const row = make('li', 'source-item'), label = make('label'), checkbox = make('input');
+    checkbox.type = 'checkbox'; checkbox.dataset.sourcePath = file.path; checkbox.setAttribute('aria-label', `选择移除 ${file.name}`);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) sourceRemovals.add(file.path); else sourceRemovals.delete(file.path);
+      updateSourceSelection();
+    });
+    const name = make('span', 'source-item-name', file.name); name.title = file.path;
+    label.append(checkbox, name, make('small', 'source-item-size', sizes(file.size))); row.append(label); rows.append(row);
+  }
+  $('source-list').replaceChildren(rows); $('source-selection').hidden = !sources.length;
+  updateSourceSelection(); updateControls();
+}
+function updateSourceSelection() {
+  const count = sourceRemovals.size, all = $('source-select-all');
+  all.checked = sources.length > 0 && count === sources.length; all.indeterminate = count > 0 && count < sources.length;
+  $('remove-sources').disabled = !count;
+  setText($('remove-sources'), `移除所选（${count}）`);
+  setText($('source-selection-count'), `待移除 ${count} / ${sources.length} 项`);
 }
 async function startUpload() {
-  await api.call('upload', { path: source.path }); notice('上传任务已开始');
+  if (uploadSubmitting || !sources.length) return;
+  uploadSubmitting = true; updateControls();
+  try {
+    const result = await api.call('uploadBatch', { paths: sources.map(file => file.path) });
+    const issue = result.stopped || result.failures.slice(0, 3).map(file => `${file.path}：${file.error}`).join('；');
+    if (issue) setSource(sources.filter(file => result.pendingPaths.includes(file.path)));
+    notice(`${result.ids.length} 个上传任务已加入任务列表${result.paused ? `，其中 ${result.paused} 个已暂停，请到“上传下载”页继续` : '，在传输队列中按顺序开始'}${issue ? `；${issue}。未建立任务的文件保留，可检查后重试` : ''}`, Boolean(issue));
+  }
+  finally { uploadSubmitting = false; updateControls(); }
 }
 $('login-form').addEventListener('submit', event => {
   event.preventDefault(); void run($('login'), async () => {
@@ -660,7 +863,22 @@ $('folder-list').addEventListener('contextmenu', event => { if (!event.target.cl
 window.addEventListener('resize', closeFileMenu);
 $('tab-settings').addEventListener('click', () => switchTab('settings'));
 $('tab-transfers').addEventListener('click', () => switchTab('transfers'));
-for (const id of ['transfer-type', 'transfer-state']) $(id).addEventListener('change', renderTasks);
+for (const id of ['transfer-type', 'transfer-state']) $(id).addEventListener('change', () => { taskPage = 0; resetTaskSelection(); renderTasks(); });
+$('select-all-tasks').addEventListener('change', event => {
+  const ids = [...taskRows].filter(([, row]) => !row.task.syncRuleId).map(([id]) => id);
+  let limited = false;
+  for (const id of ids) {
+    if (!event.target.checked) selectedTasks.delete(id);
+    else if (selectedTasks.size < 200 || selectedTasks.has(id)) selectedTasks.add(id);
+    else limited = true;
+  }
+  if (limited) notice('每次最多选择 200 个任务，请分批操作');
+  taskSelectionAnchor = null; updateTaskSelectionControls();
+});
+$('clear-task-selection').addEventListener('click', () => { resetTaskSelection(); updateTaskSelectionControls(); });
+$('cancel-selected-tasks').addEventListener('click', () => run($('cancel-selected-tasks'), () => cancelTasks([...selectedTasks])));
+$('task-previous').addEventListener('click', () => { taskPage = Math.max(0, taskPage - 1); renderTasks(); });
+$('task-next').addEventListener('click', () => { taskPage++; renderTasks(); });
 $('pause-all').addEventListener('click', () => run($('pause-all'), () => api.call('pauseAll')));
 $('download-selected').addEventListener('click', () => run($('download-selected'), downloadSelected));
 $('clear-selection').addEventListener('click', () => { resetDownloadSelection(); updateSelectionControls(); });
@@ -670,6 +888,11 @@ $('show-floating').addEventListener('click', () => { floatingDismissed = null; f
 $('floating-toggle').addEventListener('click', () => { floatingMinimized = !floatingMinimized; renderFloating(); });
 $('floating-close').addEventListener('click', () => { floatingDismissed = floatingId; renderFloating(); });
 $('floating-action').addEventListener('click', () => run($('floating-action'), () => { const task = state.tasks.find(task => task.id === floatingId); if (task) return updateTaskAction(task); }));
+for (const id of ['sync-floating-open', 'sync-floating-name']) $(id).addEventListener('click', () => switchTab('sync'));
+$('show-sync-floating').addEventListener('click', () => { floatingSyncDismissed = null; floatingMinimized = false; const rule = state.sync?.rules.find(syncActive) || [...(state.sync?.rules || [])].filter(rule => rule.progress).sort((a, b) => (b.lastRun || 0) - (a.lastRun || 0))[0]; if (rule) { $('floating-transfer').hidden = true; renderSyncFloating(rule); } });
+$('sync-floating-toggle').addEventListener('click', () => { floatingMinimized = !floatingMinimized; const rule = state.sync?.rules.find(rule => rule.id === floatingSyncId); if (rule) renderSyncFloating(rule); });
+$('sync-floating-close').addEventListener('click', () => { floatingSyncDismissed = floatingSyncKey; $('floating-sync').hidden = true; });
+$('sync-floating-action').addEventListener('click', () => run($('sync-floating-action'), () => { const rule = state.sync?.rules.find(rule => rule.id === floatingSyncId); if (rule) return syncActive(rule) || rule.state === 'queued' ? api.call('toggleSync', { id: rule.id, enabled: false }) : ['paused', 'error'].includes(rule.state) ? api.call('runSync', { id: rule.id }) : switchTab('sync'); }));
 for (const [id, key] of [['upload-concurrency', 'uploadConcurrency'], ['download-concurrency', 'downloadConcurrency'], ['concurrency', 'downloadConcurrency']]) $(id).addEventListener('change', () => run($(id), async () => {
   try { render(await api.call('saveSettings', { [key]: Number($(id).value) })); notice('并发设置已保存，新任务或暂停后继续时生效'); }
   finally { $(id).value = String(state.settings[key]); }
@@ -681,6 +904,10 @@ $('auto-clean-cache').addEventListener('change', () => run($('auto-clean-cache')
   try { render(await api.call('saveSettings', { autoCleanCache: $('auto-clean-cache').checked })); await refreshCache(); notice('自动清理设置已保存'); }
   finally { $('auto-clean-cache').checked = state.settings.autoCleanCache; }
 }));
+for (const [id, key] of [['open-at-login', 'openAtLogin'], ['start-hidden', 'startHidden'], ['close-to-tray', 'closeToTray']]) $(id).addEventListener('change', () => run($(id), async () => {
+  try { render(await api.call('saveSettings', { [key]: $(id).checked })); notice(key === 'startHidden' ? '静默启动设置已保存，下次启动生效' : '启动与托盘设置已保存'); }
+  finally { $(id).checked = Boolean(state.settings[key]); }
+}));
 $('refresh-cache').addEventListener('click', () => run($('refresh-cache'), refreshCache));
 $('clean-cache').addEventListener('click', () => run($('clean-cache'), async () => {
   const result = await api.call('cleanCache'); await refreshCache(); notice(`已清理 ${result.files} 个缓存文件，释放 ${sizes(result.bytes)}；未完成任务的恢复数据保留`);
@@ -688,10 +915,26 @@ $('clean-cache').addEventListener('click', () => run($('clean-cache'), async () 
 for (const id of ['clear-history', 'clear-history-settings']) $(id).addEventListener('click', () => run($(id), () => clearHistory()));
 for (const id of ['clear-all-history', 'clear-all-history-settings']) $(id).addEventListener('click', () => run($(id), () => clearHistory('all')));
 $('choose-source').addEventListener('click', () => run($('choose-source'), async () => {
-  const selected = await api.call('chooseSource'); if (!selected) return;
-  setSource(selected);
+  if (selectingSource || uploadSubmitting) return;
+  selectingSource = true; updateControls();
+  try { const selected = await api.call('chooseSource'); if (selected) setSource(selected); }
+  finally { selectingSource = false; updateControls(); }
 }));
 $('start-upload').addEventListener('click', () => run($('start-upload'), startUpload));
+$('source-select-all').addEventListener('change', () => {
+  sourceRemovals.clear();
+  for (const checkbox of $('source-list').querySelectorAll('input')) {
+    checkbox.checked = $('source-select-all').checked;
+    if (checkbox.checked) sourceRemovals.add(checkbox.dataset.sourcePath);
+  }
+  updateSourceSelection();
+});
+$('remove-sources').addEventListener('click', () => {
+  if (selectingSource || uploadSubmitting || !sourceRemovals.size) return;
+  const count = sourceRemovals.size;
+  setSource(sources.filter(file => !sourceRemovals.has(file.path)));
+  notice(`已从上传选择中移除 ${count} 个文件，本地原文件保留`);
+});
 $('refresh-folders').addEventListener('click', () => run($('refresh-folders'), () => refreshFolders(history, false, true)));
 $('load-more').addEventListener('click', () => run($('load-more'), () => refreshFolders(history, true)));
 $('folder-up').addEventListener('click', () => run($('folder-up'), () => refreshFolders(history.length > 1 ? history.slice(0, -1) : history)));
@@ -702,10 +945,16 @@ for (const source of ['account','share']) $(source + '-source').addEventListener
   $('account-browser').hidden = source !== 'account'; $('share-form').hidden = source !== 'share';
   $('browser-views').hidden = source !== 'account';
   $('account-source').classList.toggle('selected', source === 'account'); $('share-source').classList.toggle('selected', source === 'share'); clearBundle();
+  if (source === 'account' && directoryDirty) renderDirectory(true);
 });
 $('share-form').addEventListener('submit', event => { event.preventDefault(); void run($('share-form').querySelector('button'), async () => { clearBundle(); const request = bundleRequest; const value = await api.call('inspectShare', { url: $('share-url').value, password: $('share-password').value }); if (request === bundleRequest) showBundle(value); }); });
 $('choose-directory').addEventListener('click', () => run($('choose-directory'), async () => { const selected = await api.call('chooseDirectory'); if (selected) { outputDir = selected; $('output-directory').textContent = selected; $('output-directory').title = selected; } }));
-$('start-download').addEventListener('click', () => run($('start-download'), async () => { await api.call('download', { key: bundle.key, outputDir, concurrency: Number($('concurrency').value) }); notice('下载任务已开始，全部校验后将自动合并'); }));
+$('start-download').addEventListener('click', () => run($('start-download'), async () => {
+  if (downloadSubmitting) return;
+  downloadSubmitting = true; updateControls();
+  try { await api.call('download', { key: bundle.key, outputDir, concurrency: Number($('concurrency').value) }); notice('下载已加入传输队列，全部校验后将自动合并'); }
+  finally { downloadSubmitting = false; updateControls(); }
+}));
 let dragDepth = 0;
 const dropZone = $('choose-source');
 const hasFiles = event => [...(event.dataTransfer?.types || [])].includes('Files');
@@ -717,19 +966,28 @@ dropZone.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth
 dropZone.addEventListener('drop', event => {
   event.preventDefault(); dragDepth = 0; dropZone.classList.remove('dragging');
   void run(null, async () => {
-    if (selectingSource) return;
+    if (selectingSource || uploadSubmitting) throw new Error('正在加入文件，请稍候再拖入');
     const files = [...(event.dataTransfer?.files || [])];
-    if (files.length !== 1) throw new Error('每次请拖入一个文件，暂不支持批量拖拽');
-    const filePath = api.filePath(files[0]);
-    if (!filePath) throw new Error('请拖入本机的实际文件，不支持网页链接或虚拟文件');
+    if (!files.length || files.length > 200) throw new Error('每次请拖入 1–200 个文件');
+    const paths = files.map(file => api.filePath(file));
+    if (paths.some(file => !file)) throw new Error('请拖入本机的实际文件，不支持网页链接或虚拟文件；本批未加入队列');
     selectingSource = true; updateControls();
     try {
-      setSource(await api.call('selectSource', { path: filePath }));
-      if (state.account && !state.sync?.busy && !state.tasks.some(task => task.state === 'running')) await startUpload();
-      else notice(state.account ? '文件已选中，当前任务完成或暂停后点击上传' : '文件已选中，登录后点击上传');
+      setSource(await api.call('selectSources', { paths }));
+      if (state.account) await startUpload();
+      else notice(`已选中 ${sources.length} 个文件，登录后点击上传`);
     } finally { selectingSource = false; updateControls(); }
   });
 });
 for (const [id, action] of [['window-minimize', 'windowMinimize'], ['window-maximize', 'windowToggleMaximize'], ['window-close', 'windowClose']]) $(id).addEventListener('click', () => run($(id), () => api.call(action)));
 api.onState(render);
+api.onOpenSettings(() => switchTab('settings'));
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    if (!$('transfers-panel').hidden && tasksDirty) renderTasks();
+    if (!$('sync-panel').hidden) syncUI.render(state);
+    if (!$('download-panel').hidden && directoryDirty) renderDirectory(true);
+    renderFloating();
+  }
+});
 void api.call('state').then(render).catch(error => notice(error.message, true));

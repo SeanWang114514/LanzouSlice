@@ -129,8 +129,8 @@ test('ordinary downloads reject account mismatch, refuse overwrites, preserve re
   assert.equal(engine.tasks.get(duplicate).state, 'failed'); assert.match(engine.tasks.get(duplicate).error, /已存在/);
   assert.equal((await stat(empty.resultPath)).size, 0);
   client.uid = '456';
-  await engine.resume(duplicate); await engine.active.get(duplicate)?.promise;
-  assert.match(engine.tasks.get(duplicate).error, /创建此任务的蓝奏云账号/);
+  await assert.rejects(engine.resume(duplicate), /创建此任务的蓝奏云账号/);
+  assert.equal(engine.active.has(duplicate), false);
   client.uid = '123'; await engine.clearHistory({ scope: 'all' }); assert.equal((await stat(empty.resultPath)).size, 0);
 });
 

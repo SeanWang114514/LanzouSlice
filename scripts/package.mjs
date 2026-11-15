@@ -14,7 +14,7 @@ const result = await packager({
   appCopyright:'Based on CYQawa/YunX. AGPL-3.0-or-later.',
   win32metadata:{ProductName:'蓝奏切片',FileDescription:'蓝奏云切片上传与并发下载合并'},
   ignore:[/^\/upstream(?:\/|$)/,/^\/\.tmp(?:\/|$)/,/^\/dist(?:\/|$)/,/^\/tests(?:\/|$)/,/^\/scripts(?:\/|$)/,/^\/\.git(?:\/|$)/,/^\/蓝奏云切片上传-可行性与实施计划\.md$/],
-  download:{cacheRoot:path.resolve('.tmp/electron-cache')}
+  download:{cacheRoot:path.resolve('.tmp/electron-cache'), checksums:JSON.parse(await readFile('node_modules/electron/checksums.json', 'utf8'))}
 });
 console.log('PACKAGED',JSON.stringify(result));
 for (const output of result) {
@@ -43,7 +43,7 @@ async function zipPaths(paths, destination, prefix = '') {
   zip.end(); await done;
 }
 const sourceArchive = path.join(releaseDir,'LanzouSlice-source.zip');
-await zipPaths(['src','ui','scripts','tests','package.json','package-lock.json','README.md','验证结果.md','LICENSE','THIRD_PARTY_NOTICES.md','upstream/yunx-source.json'],sourceArchive);
+await zipPaths(['src','ui','scripts','tests','package.json','package-lock.json','README.md','验证结果.md','性能优化验证.md','低资源占用优化实施计划.md','启动与托盘实施计划.md','LICENSE','THIRD_PARTY_NOTICES.md','upstream/yunx-source.json'],sourceArchive);
 console.log('SOURCE_ARCHIVE',sourceArchive);
 const portableArchive = path.join(releaseDir,'LanzouSlice-Windows-x64.zip');
 await zipPaths(result,portableArchive,releaseDir);

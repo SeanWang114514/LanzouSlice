@@ -312,7 +312,7 @@ test('download/cache directories and auto-clean settings persist with serialized
   const downloadDir = path.join(dir, '下载 [中文] &+'), cacheDir = path.join(dir, '缓存', 'LanzouSliceCache');
   await Promise.all([engine.storage.configure({ downloadDir }), engine.storage.configure({ cacheDir, autoCleanCache: false })]);
   const recovered = new TransferEngine({ client, dataDir: engine.dataDir }); await recovered.init();
-  assert.deepEqual(recovered.storage.settings, { downloadDir, cacheDir, autoCleanCache: false, uploadConcurrency: 2, downloadConcurrency: 4, browserView: 'smart' });
+  assert.deepEqual(recovered.storage.settings, { downloadDir, cacheDir, autoCleanCache: false, uploadConcurrency: 2, downloadConcurrency: 4, browserView: 'smart', openAtLogin: false, startHidden: false, closeToTray: false });
   await assert.rejects(() => recovered.storage.configure({ cacheDir: '../unsafe' }), /绝对路径/);
   await assert.rejects(() => recovered.storage.configure({ autoCleanCache: 'yes' }), /无效/);
   assert.deepEqual(recovered.storage.settings, engine.storage.settings);
@@ -500,8 +500,8 @@ test('account tasks cannot resume against a different signed-in account', async 
   const bundle = await engine.inspectFolder(upload.folderId);
   const id = await engine.createDownload(bundle, dir); await engine.active.get(id)?.promise;
   const task = engine.tasks.get(id); assert.equal(task.state, 'failed'); // Existing source is protected.
-  client.uid = 'different'; await engine.resume(id); await engine.active.get(id)?.promise;
-  assert.match(task.error, /创建此任务的蓝奏云账号/);
+  client.uid = 'different'; await assert.rejects(engine.resume(id), /创建此任务的蓝奏云账号/);
+  assert.equal(engine.active.has(id), false);
 });
 
 test('80 MiB boundaries reserve container overhead, including empty files', () => {

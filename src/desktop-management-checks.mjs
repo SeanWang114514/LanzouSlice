@@ -8,7 +8,11 @@ export async function checkFileManagement(window, { evaluate, until, capture, fi
   const row = id => `document.querySelector('.folder-row[data-entry-id="${id}"]')`;
   const selected = () => evaluate(`[...document.querySelectorAll('[data-download-select]:checked')].map(box=>box.dataset.downloadSelect).sort()`);
   const context = async (id, expected = true) => {
-    if (expected) await until(`!document.querySelector('#refresh-folders').disabled&&!/待识别|正在识别/.test(document.querySelector('#recognition-status').textContent)`);
+    if (expected) {
+      await until(`!document.querySelector('#refresh-folders').disabled&&!/待识别|正在识别/.test(document.querySelector('#recognition-status').textContent)`);
+      // Recognition completion can still have a 100 ms merged directory render pending.
+      await evaluate(`new Promise(resolve=>setTimeout(resolve,150))`);
+    }
     await evaluate(`${row(id)}.querySelector('.file-name').scrollIntoView({block:'nearest'});new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))`);
     const point = await evaluate(`(()=>{const n=${row(id)}.querySelector('.file-name'),r=n.getBoundingClientRect(),x=Math.round(r.left+r.width/2),y=Math.round(r.top+r.height/2);if(!n.contains(document.elementFromPoint(x,y)))throw new Error('Context click is obscured');return {x,y}})()`);
     window.focus();

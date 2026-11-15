@@ -90,6 +90,42 @@ test('failed refresh removes stale slice hints and remains retryable; expired au
   assert.equal(seen.length, 0);
 });
 
+test('temporary network failures retain stale previews without renewing their age; confirmed ordinary results replace them', async t => {
+  let now = 1_000_000;
+  const cache = await fixture(t, { now: () => now, identify: async () => { throw Object.assign(new Error('网络暂时不可用'), { code: 'NETWORK' }); } });
+  cache.remember('123', '10', preview('保留原名.exe'), 'sliceabc');
+  now += 300_000;
+  const [result] = await cache.scan('123', [{ id: '10', name: 'sliceabc' }]);
+  assert.equal(result.status, 'preview'); assert.equal(result.stale, true); assert.match(result.message, /网络暂时不可用/);
+  assert.equal(cache.get('123', '10').originalName, '保留原名.exe'); assert.equal(cache.get('123', '10').stale, true);
+  cache.identify = async () => ({ status: 'ordinary' });
+  assert.equal((await cache.scan('123', [{ id: '10', name: 'sliceabc' }]))[0].status, 'ordinary');
+  assert.equal(cache.get('123', '10').originalName, undefined);
+});
+
+test('recognition deadlines release worker slots, preserve display hints and keep uncached failures retryable', async t => {
+  const deadlines = [], started = [], seen = [];
+  t.mock.method(AbortSignal, 'timeout', ms => {
+    assert.equal(ms, 12_000); const controller = new AbortController(); deadlines.push(controller); return controller.signal;
+  });
+  let startTwo; const ready = new Promise(resolve => { startTwo = resolve; });
+  let third; const advanced = new Promise(resolve => { third = resolve; });
+  const cache = await fixture(t, { identify: async (id, signal) => {
+    started.push(id); if (started.length === 2) startTwo();
+    if (id === '12') { third(); return { status: 'ordinary' }; }
+    await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  cache.remember('123', '10', preview('慢目录.exe'));
+  const scan = cache.scan('123', ['10', '11', '12'].map(id => ({ id })), { force: true, onResult: result => seen.push(result) });
+  try {
+    await ready; deadlines[0].abort(new DOMException('deadline', 'TimeoutError')); await advanced;
+    assert.equal(seen[0].id, '10'); assert.equal(seen[0].status, 'preview'); assert.equal(seen[0].stale, true); assert.match(seen[0].message, /超时/);
+    assert.equal(started.length, 3); assert.equal(cache.get('123', '10').originalName, '慢目录.exe');
+  } finally { for (const controller of deadlines) controller.abort(new DOMException('deadline', 'TimeoutError')); }
+  const results = await scan;
+  assert.equal(results.find(result => result.id === '11').status, 'unavailable'); assert.equal(cache.get('123', '11'), null);
+});
+
 test('damaged cache and invalid entries do not block browsing; cache stays bounded', async t => {
   const cache = await fixture(t);
   await writeFile(cache.file, '{broken'); await cache.init(); assert.equal(cache.entries.size, 0);

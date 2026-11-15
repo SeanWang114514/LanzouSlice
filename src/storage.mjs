@@ -9,7 +9,7 @@ export const isConcurrency = value => Number.isInteger(value) && value >= 1 && v
 export class LocalStorage {
   constructor(dataDir, downloadDir = path.join(dataDir, 'downloads')) {
     this.file = path.join(dataDir, 'settings.json');
-    this.settings = { downloadDir, cacheDir: path.join(dataDir, 'cache'), autoCleanCache: true, uploadConcurrency: 2, downloadConcurrency: 4, browserView: 'smart' };
+    this.settings = { downloadDir, cacheDir: path.join(dataDir, 'cache'), autoCleanCache: true, uploadConcurrency: 2, downloadConcurrency: 4, browserView: 'smart', openAtLogin: false, startHidden: false, closeToTray: false };
     this.queue = Promise.resolve();
   }
   async init() {
@@ -17,6 +17,7 @@ export class LocalStorage {
       const saved = JSON.parse(await readFile(this.file, 'utf8'));
       for (const key of ['downloadDir', 'cacheDir']) if (typeof saved[key] === 'string' && path.isAbsolute(saved[key])) this.settings[key] = saved[key];
       if (typeof saved.autoCleanCache === 'boolean') this.settings.autoCleanCache = saved.autoCleanCache;
+      for (const key of ['openAtLogin', 'startHidden', 'closeToTray']) if (typeof saved[key] === 'boolean') this.settings[key] = saved[key];
       for (const key of ['uploadConcurrency', 'downloadConcurrency']) if (isConcurrency(saved[key])) this.settings[key] = saved[key];
       if (['raw', 'smart'].includes(saved.browserView)) this.settings.browserView = saved.browserView;
     } catch (error) { if (error.code !== 'ENOENT') this.warning = '设置文件无法读取，已使用默认目录；任务恢复记录仍保留。'; }
@@ -25,13 +26,13 @@ export class LocalStorage {
     const work = this.queue.catch(() => {}).then(async () => {
       const next = { ...this.settings };
       for (const key of Object.keys(patch)) {
-        if (!['downloadDir', 'cacheDir', 'autoCleanCache', 'uploadConcurrency', 'downloadConcurrency', 'browserView'].includes(key)) throw new Error('未知设置');
+        if (!['downloadDir', 'cacheDir', 'autoCleanCache', 'uploadConcurrency', 'downloadConcurrency', 'browserView', 'openAtLogin', 'startHidden', 'closeToTray'].includes(key)) throw new Error('未知设置');
         if (key === 'browserView') {
           if (!['raw', 'smart'].includes(patch[key])) throw new Error('网盘显示模式无效');
         } else if (['uploadConcurrency', 'downloadConcurrency'].includes(key)) {
           if (!isConcurrency(patch[key])) throw new Error('并发数必须为 1–8 的整数');
-        } else if (key === 'autoCleanCache') {
-          if (typeof patch[key] !== 'boolean') throw new Error('自动清理设置无效');
+        } else if (['autoCleanCache', 'openAtLogin', 'startHidden', 'closeToTray'].includes(key)) {
+          if (typeof patch[key] !== 'boolean') throw new Error('开关设置无效');
         } else {
           if (typeof patch[key] !== 'string' || !path.isAbsolute(patch[key])) throw new Error('目录必须为绝对路径');
           await mkdir(patch[key], { recursive: true });
