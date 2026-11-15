@@ -10,6 +10,7 @@ import { TransferEngine, localFileName } from './transfer.mjs';
 import { FolderRecognition } from './folder-recognition.mjs';
 import { CloudFiles } from './cloud-files.mjs';
 import { openTaskFolder } from './task-location.mjs';
+import { SyncManager } from './sync.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const smokeTest = process.argv.includes('--smoke-test');
@@ -30,7 +31,7 @@ let window, loginWindow, engine, client, quitting = false, account = null, encry
 const bundles = new Map();
 const dataDir = app.getPath('userData');
 const credentialPath = path.join(dataDir, 'session.bin');
-let identifyController, recognition, cloudFiles;
+let identifyController, recognition, cloudFiles, sync;
 const seededUploads = new Set();
 function seedUploads(initial = false) {
   let changed = false;
@@ -53,7 +54,7 @@ function bundleInfo(bundle, version) {
   return { key, ...manifestInfo(bundle) };
 }
 
-function snapshot() { return { account, tasks: engine.publicTasks(), dataDir, settings: engine.storage.settings, settingsWarning: engine.storage.warning, version: app.getVersion(), encryptionAvailable }; }
+function snapshot() { return { account, tasks: engine.publicTasks(), sync: sync?.publicState(), dataDir, settings: engine.storage.settings, settingsWarning: engine.storage.warning, version: app.getVersion(), encryptionAvailable, windowState: { maximized: Boolean(window && !window.isDestroyed() && window.isMaximized()), fullscreen: Boolean(window && !window.isDestroyed() && window.isFullScreen()) } }; }
 function emitState() {
   seedUploads();
   if (account && !client.loggedIn) account = null;
@@ -67,6 +68,7 @@ async function saveSession(remember, label) {
     await writeFile(credentialPath, await safeStorage.encryptStringAsync(JSON.stringify({ jar: await client.jar.serialize(), label: account.label })), { mode: 0o600 });
   } else await rm(credentialPath, { force: true });
   emitState();
+  sync?.wake();
 }
 async function restoreSession() {
   const version = authVersion;
@@ -84,6 +86,7 @@ function authSession() { return session.fromPartition('lanzou-auth'); }
 async function importOfficialSession(remember) {
   authVersion++;
   resetReads();
+  await sync.pauseAll();
   await engine.pauseAll();
   const cookies = await authSession().cookies.get({});
   if (!cookies.some(c => c.name === 'ylogin' || c.name === 'phpdisk_info')) throw new Error('尚未检测到登录，请先在官网登录窗口完成登录');
@@ -130,9 +133,17 @@ async function sourceInfo(filePath) {
 async function command(action, payload = {}) {
   switch (action) {
     case 'state': return snapshot();
+    case 'windowMinimize': window.minimize(); return null;
+    case 'windowToggleMaximize':
+      if (window.isFullScreen()) window.setFullScreen(false);
+      else if (window.isMaximized()) window.unmaximize();
+      else window.maximize();
+      return null;
+    case 'windowClose': setImmediate(() => window.close()); return null;
     case 'login': {
       authVersion++;
       resetReads();
+      await sync.pauseAll();
       await engine.pauseAll();
       account = null; emitState();
       await client.login(String(payload.account || ''), String(payload.password || ''));
@@ -144,6 +155,7 @@ async function command(action, payload = {}) {
     case 'logout':
       authVersion++;
       resetReads();
+      await sync.pauseAll();
       await engine.pauseAll(); client.jar = new CookieJar(); client.uid = client.vei = null; account = null;
       bundles.clear();
       await rm(credentialPath, { force: true });
@@ -153,6 +165,14 @@ async function command(action, payload = {}) {
       return result.canceled ? null : sourceInfo(result.filePaths[0]);
     }
     case 'selectSource': return sourceInfo(String(payload.path || ''));
+    case 'chooseSyncSource': {
+      const result = await dialog.showOpenDialog(window, { title: payload.kind === 'directory' ? '选择自动同步文件夹' : '选择自动同步文件', properties: [payload.kind === 'directory' ? 'openDirectory' : 'openFile'] });
+      return result.canceled ? null : result.filePaths[0];
+    }
+    case 'saveSync': return sync.put(payload);
+    case 'runSync': await sync.request(String(payload.id)); return null;
+    case 'toggleSync': await sync.toggle(String(payload.id), payload.enabled === true); return null;
+    case 'removeSync': await sync.remove(String(payload.id)); return null;
     case 'chooseDirectory': {
       const result = await dialog.showOpenDialog(window, { title: '选择下载和合并保存目录', properties: ['openDirectory', 'createDirectory'] });
       if (result.canceled) return null;
@@ -236,9 +256,18 @@ async function command(action, payload = {}) {
       const entry = bundles.get(payload.key); if (!entry || entry.version !== authVersion) throw new Error('请重新选择远程文件任务');
       return engine.createDownload(entry.bundle, payload.outputDir ? String(payload.outputDir) : engine.storage.settings.downloadDir, payload.concurrency);
     }
-    case 'pause': await engine.pause(String(payload.id)); return null;
-    case 'pauseAll': await engine.pauseAll(); return null;
-    case 'resume': return engine.resume(String(payload.id), String(payload.password || ''));
+    case 'pause': {
+      const task = engine.tasks.get(String(payload.id));
+      if (task?.syncRuleId) await sync.toggle(task.syncRuleId, false); else await engine.pause(String(payload.id)); return null;
+    }
+    case 'pauseAll':
+      for (const rule of sync.publicState().rules) if (rule.enabled || rule.state === 'queued' || sync.active?.id === rule.id) await sync.toggle(rule.id, false);
+      await engine.pauseAll(); return null;
+    case 'resume': {
+      const task = engine.tasks.get(String(payload.id));
+      if (task?.syncRuleId) { sync.wake(); return sync.request(task.syncRuleId); }
+      return engine.resume(String(payload.id), String(payload.password || ''));
+    }
     case 'showResult': return openTaskFolder(engine.tasks.get(String(payload.id)), shell);
     case 'exportManifest': {
       const task = engine.tasks.get(payload.id);
@@ -264,6 +293,8 @@ recognition = new FolderRecognition({ dataDir, identify: async (id, signal) => {
 } });
 await recognition.init(); seedUploads(true); engine.on('change', emitState);
 cloudFiles = new CloudFiles({ client, engine, recognition, version: () => authVersion, cancelReads: resetReads });
+sync = new SyncManager({ engine, dataDir, busy: () => cloudFiles.busy, version: () => authVersion });
+await sync.init(); sync.on('change', emitState); sync.start();
 trace('engine initialized');
 ipcMain.handle('app:command', async (event, { action, payload }) => {
   if (event.senderFrame?.url !== appURL) throw new Error('不允许此页面访问本地功能');
@@ -273,7 +304,8 @@ ipcMain.handle('app:command', async (event, { action, payload }) => {
     return { ok: false, error: error.message || '操作失败', code: error.code };
   }
 });
-window = new BrowserWindow({ width: 1260, height: 900, minWidth: 940, minHeight: 700, show: !smokeTest, title: '蓝奏切片', backgroundColor: '#e4e6ee', icon: path.join(root, 'ui/assets/app-icon.png'), autoHideMenuBar: true, webPreferences: { preload: path.join(root, 'src/preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, offscreen: smokeTest } });
+window = new BrowserWindow({ width: 1260, height: 900, minWidth: 940, minHeight: 700, frame: false, show: !smokeTest, title: '蓝奏切片', backgroundColor: '#e4e6ee', icon: path.join(root, 'ui/assets/app-icon.png'), autoHideMenuBar: true, webPreferences: { preload: path.join(root, 'src/preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, offscreen: smokeTest } });
+for (const event of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) window.on(event, emitState);
 trace('window created');
 window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 window.webContents.on('will-navigate', (event, url) => { if (url !== appURL) event.preventDefault(); });
@@ -282,7 +314,9 @@ await window.loadURL(appURL);
 trace('window loaded');
 if (smokeTest) {
   try {
-    const features = smokeApi ? await (await import('./desktop-checks.mjs')).checkReadAndDrop(window, {
+    const features = smokeApi ? process.argv.includes('--smoke-sync') ? await (await import('./desktop-sync-checks.mjs')).checkSync(window, {
+      sourceDir: process.argv.find(arg => arg.startsWith('--smoke-sync-source='))?.slice('--smoke-sync-source='.length), outputDir: smokeOutput
+    }) : await (await import('./desktop-checks.mjs')).checkReadAndDrop(window, {
       firstFile: process.argv.find(arg => arg.startsWith('--smoke-drop-file='))?.slice('--smoke-drop-file='.length),
       secondFile: process.argv.find(arg => arg.startsWith('--smoke-second-file='))?.slice('--smoke-second-file='.length),
       fixtureOrigin: smokeApi.origin,
@@ -319,12 +353,12 @@ if (smokeTest) {
     if (!result.hasBridge || !result.upload || !result.download || !result.downloadTabWorks || !result.shareTabWorks || !result.namingVisible || result.renderedTaskCount !== result.taskCount) throw new Error('桌面组件未完整加载');
     quitting = true; app.exit(0);
   } catch (error) { console.error(error.message); quitting = true; app.exit(1); }
-} else void restoreSession().then(emitState);
+} else void restoreSession().then(() => { emitState(); sync.wake(); });
 app.on('before-quit', event => {
   if (quitting) return;
   event.preventDefault(); quitting = true;
   resetReads();
-  void engine.pauseAll().then(() => recognition.save()).catch(() => {}).finally(() => app.quit());
+  void sync.close().then(() => engine.pauseAll()).then(() => recognition.save()).catch(() => {}).finally(() => app.quit());
 });
 app.on('window-all-closed', () => app.quit());
 }).catch(error => {

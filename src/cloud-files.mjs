@@ -38,6 +38,7 @@ export class CloudFiles {
     });
   }
   async change(action, payload) {
+    if (this.engine.syncOwner) throw new Error('自动同步正在运行，请先暂停规则再管理云端文件');
     const version = this.account(), ownerUid = this.client.uid;
     if (!['create', 'rename', 'delete'].includes(action)) throw new Error('未知文件管理操作');
     if (this.busy) throw new Error('正在处理网盘操作，请稍候');

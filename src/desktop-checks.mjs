@@ -152,13 +152,14 @@ export async function checkReadAndDrop(window, { firstFile, secondFile, outputDi
     const theme = await checkNeumorphism();
     const iconChecks = await evaluate(`(()=>{
       const hosts=[...document.querySelectorAll('[data-icon]')],logo=document.querySelector('.logo');
-      const details=hosts.map(host=>{const svg=host.querySelector('svg'),style=svg&&getComputedStyle(svg);return {name:host.dataset.icon,vector:!!svg,hidden:svg?.getAttribute('aria-hidden')==='true',nonFocusable:svg?.getAttribute('focusable')==='false',stroke:style?.stroke,fill:style?.fill,width:style?.width,height:style?.height,label:host.getAttribute('aria-label')}});
+      const details=hosts.map(host=>{const svg=host.querySelector('svg'),style=svg&&getComputedStyle(svg);return {id:host.id,name:host.dataset.icon,vector:!!svg,hidden:svg?.getAttribute('aria-hidden')==='true',nonFocusable:svg?.getAttribute('focusable')==='false',stroke:style?.stroke,fill:style?.fill,width:style?.width,height:style?.height,label:host.getAttribute('aria-label')}});
       return {static:details,logoLoaded:logo.complete&&logo.naturalWidth>0,quietSurfaces:['.logo','.account-icon','.file-icon'].every(selector=>getComputedStyle(document.querySelector(selector)).boxShadow==='none')};
     })()`);
-    assert.equal(iconChecks.static.length,5);
+    assert.equal(iconChecks.static.length,8);
     assert.ok(iconChecks.static.every(item=>item.vector&&item.hidden&&item.nonFocusable&&item.fill==='none'&&item.stroke!=='none'));
     assert.ok(iconChecks.logoLoaded&&iconChecks.quietSurfaces);
-    assert.equal(iconChecks.static.find(item=>item.name==='close').label,'隐藏传输浮窗');
+    assert.equal(iconChecks.static.find(item=>item.id==='floating-close').label,'隐藏传输浮窗');
+    assert.deepEqual(iconChecks.static.filter(item=>item.id.startsWith('window-')).map(item=>item.label),['最小化','最大化','关闭']);
     const { root } = await web.debugger.sendCommand('DOM.getDocument');
     const { nodeId } = await web.debugger.sendCommand('DOM.querySelector', { nodeId: root.nodeId, selector: '#smoke-files' });
     async function drop(files) {

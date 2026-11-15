@@ -216,7 +216,10 @@ export class TransferEngine extends EventEmitter {
     if (this.meters.has(task.id)) snapshot.elapsedMs = this.meters.get(task.id).read(task).elapsedMs;
     // Never write account passwords or share passcodes into task journals.
     delete snapshot.password;
-    const next = previous.catch(() => {}).then(() => atomicJSON(path.join(this.taskDir(task.id), 'task.json'), snapshot));
+    const next = previous.catch(() => {}).then(async () => {
+      if (task.syncRuleId && this.persistSyncTask) await this.persistSyncTask(snapshot);
+      await atomicJSON(path.join(this.taskDir(task.id), 'task.json'), snapshot);
+    });
     this.persistQueue.set(task.id, next); await next;
   }
   async init() {
@@ -261,7 +264,7 @@ export class TransferEngine extends EventEmitter {
     this.clearingHistory = true;
     let removed = 0;
     try {
-      const selected = [...this.tasks.values()].filter(task => (!id || task.id === id) && (task.state === 'completed' || scope === 'all' && task.state === 'failed') && !this.active.has(task.id));
+      const selected = [...this.tasks.values()].filter(task => (!id || task.id === id) && (task.state === 'completed' || scope === 'all' && task.state === 'failed') && !this.active.has(task.id) && !this.syncPendingIds?.has(task.id));
       const ids = new Set(selected.map(task => task.id));
       const protectedPaths = new Set([...this.tasks.values()].filter(task => !ids.has(task.id)).map(task => diskKey(this.storage.directory(task, this.taskDir(task.id))))), protectedFiles = this.protectedFiles();
       for (const task of selected) {
@@ -276,6 +279,8 @@ export class TransferEngine extends EventEmitter {
     } finally { this.clearingHistory = false; this.notify(true); this.startNextDownload(); }
   }
   start(task, work) {
+    if (this.syncOwner && task.syncRuleId !== this.syncOwner) throw new Error('自动同步正在运行，请等待或先暂停同步规则');
+    if (task.syncRuleId && this.syncOwner !== task.syncRuleId) throw new Error('请从自动同步页面继续此规则');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
     if (this.creatingBatch || this.pausingAll) throw new Error('正在准备或暂停批量任务，请稍候');
     if (this.active.has(task.id)) throw new Error('任务已经在运行');
@@ -311,7 +316,7 @@ export class TransferEngine extends EventEmitter {
     return task.id;
   }
   startNextDownload() {
-    if (this.active.size || this.creatingBatch || this.pausingAll || this.clearingHistory || !this.client.loggedIn) return;
+    if (this.syncOwner || this.active.size || this.creatingBatch || this.pausingAll || this.clearingHistory || !this.client.loggedIn) return;
     const task = [...this.tasks.values()].find(task => task.state === 'queued' && task.ownerUid === this.client.uid);
     if (task) this.start(task, signal => this.runDownload(task, signal));
   }
@@ -332,13 +337,15 @@ export class TransferEngine extends EventEmitter {
     try { await this.pausePromise; }
     finally { this.pausingAll = false; this.pausePromise = null; this.notify(true); }
   }
-  async createUpload(sourcePath) {
+  async createUpload(sourcePath, options = {}) {
+    if (this.syncOwner && options.syncRuleId !== this.syncOwner) throw new Error('自动同步正在运行，请稍候');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
     if (this.active.size) throw new Error('请先完成或暂停当前任务');
     const info = await stat(sourcePath); if (!info.isFile()) throw new Error('请选择文件');
     localFileName(path.basename(sourcePath));
-    const id = randomUUID();
+    const id = options.id || randomUUID();
     const task = { id, type: 'upload', sourcePath, originalName: path.basename(sourcePath), originalSize: info.size, sourceMtime: info.mtimeMs, totalParts: planParts(info.size, this.maxPartBytes).length, concurrency: this.storage.settings.uploadConcurrency, createdAt: new Date().toISOString(), state: 'paused', progress: 0, phase: 'prepare', message: '准备上传', receipts: {} };
+    if (options.syncRuleId) Object.assign(task, { syncRuleId: options.syncRuleId, parentFolderId: options.parentFolderId, syncRelativePath: options.relativePath, sourceSha256: options.sha256 });
     task.ownerUid = this.client.uid; task.cachePath = await this.storage.allocate(id);
     this.tasks.set(id, task); await this.persist(task);
     return this.start(task, signal => this.runUpload(task, signal));
@@ -360,7 +367,7 @@ export class TransferEngine extends EventEmitter {
     if (task.sourceSha256 && task.sourceSha256 !== digest) throw new Error('源文件内容已变化，请重新上传');
     task.sourceSha256 = digest; await this.persist(task);
     if (!task.folderId) {
-      const root = await this.client.list('-1', signal);
+      const root = await this.client.list(task.parentFolderId || '-1', signal);
       const previousName = task.folderName;
       const compatibleName = `slice${task.id.replaceAll('-', '')}`;
       // Reuse a legacy directory if an earlier create succeeded without an acknowledgement.
@@ -372,7 +379,7 @@ export class TransferEngine extends EventEmitter {
       await this.persist(task);
       const matches = root.filter(x => x.isFolder && x.name === task.folderName);
       if (matches.length > 1) throw new Error('发现多个同名任务目录，请在官网核实后继续');
-      task.folderId = matches[0]?.id || await this.client.createFolder(task.folderName, signal); await this.persist(task);
+      task.folderId = matches[0]?.id || await this.client.createFolder(task.folderName, signal, task.parentFolderId || '-1'); await this.persist(task);
     }
     const remote = await this.client.list(task.folderId, signal);
     const confirmed = new Set(parts.filter(part => {
@@ -435,9 +442,9 @@ export class TransferEngine extends EventEmitter {
     if (firstError) throw firstError;
     signal.throwIfAborted();
     const after = await stat(task.sourcePath);
-    if (after.size !== source.size || after.mtimeMs !== source.mtimeMs) throw new Error('上传期间源文件发生变化，未提交清单，请重新上传');
+    if (after.size !== source.size || after.mtimeMs !== source.mtimeMs || task.syncRuleId && after.ctimeMs !== source.ctimeMs) throw new Error('上传期间源文件发生变化，未提交清单，请重新上传');
     // Do not add fields to a legacy manifest when resuming an already committed upload.
-    const naming = task.manifest ? task.manifest.naming : task.naming;
+    const naming = task.manifest ? task.manifest.naming : { ...task.naming, ...(task.syncRuleId ? { syncRuleId: task.syncRuleId, relativePath: task.syncRelativePath } : {}) };
     const manifest = validateManifest({ format: 'lanzou-slice', version: 1, taskId: task.id, originalName: task.originalName, ...(naming ? { naming } : {}), originalSize: source.size, sha256: digest, maxPartBytes: this.maxPartBytes, createdAt: task.createdAt, parts: parts.map(p => {
       const { index, name, offset, payloadSize, uploadSize, sha256: digest, remoteId } = task.receipts[p.index];
       return { index, name, offset, payloadSize, uploadSize, sha256: digest, remoteId };
@@ -515,6 +522,7 @@ export class TransferEngine extends EventEmitter {
     return { manifest, source, files: resolved, password: options.password || '', indexNames };
   }
   async createDownload(bundle, outputDir = this.storage.settings.downloadDir, concurrency = this.storage.settings.downloadConcurrency) {
+    if (this.syncOwner) throw new Error('自动同步正在运行，请稍候');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
     if (this.active.size) throw new Error('请先完成或暂停当前任务');
     validateManifest(bundle.manifest);
@@ -527,6 +535,7 @@ export class TransferEngine extends EventEmitter {
     return this.start(task, signal => this.runDownload(task, signal));
   }
   async createDownloadBatch(files, outputDir = this.storage.settings.downloadDir, concurrency = this.storage.settings.downloadConcurrency) {
+    if (this.syncOwner) throw new Error('自动同步正在运行，请稍候');
     if (this.creatingBatch || this.pausingAll || this.clearingHistory) throw new Error('正在处理任务，请稍候');
     if (!this.client.loggedIn) throw new LanzouError('请先登录蓝奏云', 'AUTH_EXPIRED');
     if (!Array.isArray(files) || !files.length || files.length > 200 || !path.isAbsolute(outputDir) || !isConcurrency(concurrency)) throw new Error('批量下载参数无效');
@@ -610,6 +619,7 @@ export class TransferEngine extends EventEmitter {
     task.resultPath = result.path; task.message = '下载、合并及 SHA-256 校验完成';
   }
   async createFileDownload(file, outputDir = this.storage.settings.downloadDir) {
+    if (this.syncOwner) throw new Error('自动同步正在运行，请稍候');
     if (this.clearingHistory) throw new Error('正在清理历史，请稍后开始任务');
     if (this.active.size) throw new Error('请先完成或暂停当前任务');
     if (!this.client.loggedIn) throw new LanzouError('请先登录蓝奏云', 'AUTH_EXPIRED');

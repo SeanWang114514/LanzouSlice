@@ -1,5 +1,6 @@
 import { roundedBytes, duration } from './transfer-format.js';
 import { icon } from './icons.js';
+import { createSyncUI } from './sync.js';
 for (const node of document.querySelectorAll('[data-icon]')) node.replaceChildren(icon(node.dataset.icon));
 const $ = id => document.getElementById(id);
 const api = window.lanzou;
@@ -17,6 +18,7 @@ const selectedDownloads = new Set();
 let selectionAnchor = null;
 let batchSubmitting = false;
 const statusText = task => ({ queued: '排队中', running: '进行中', paused: '已暂停', failed: '失败', completed: '已完成' }[task.state] || task.state);
+const syncUI = createSyncUI({ api, run, notice, make, getState: () => state });
 const smartView = () => (state.settings?.browserView || 'smart') === 'smart';
 const sizes = value => {
   if (!value) return '0 B';
@@ -35,7 +37,7 @@ async function run(button, action) {
   finally { if (button) button.disabled = wasDisabled; updateControls(); }
 }
 function updateControls() {
-  const logged = Boolean(state.account); const running = state.tasks.some(t => t.state === 'running');
+  const logged = Boolean(state.account); const running = state.sync?.busy || state.tasks.some(t => t.state === 'running');
   $('start-upload').disabled = !logged || !source || running || managementBusy || batchSubmitting || state.tasks.some(task => task.state === 'queued');
   $('start-download').disabled = !bundle || !outputDir || running || managementBusy;
   $('upload-hint').textContent = running ? '当前有任务运行，可在右下角或“上传下载”页暂停。' : !logged ? '请先登录蓝奏云。' : !source ? '请选择需要上传的原始文件。' : '准备就绪，将自动创建云端文件夹。';
@@ -48,7 +50,7 @@ function updateControls() {
   $('load-more').hidden = !directoryHasMore;
   $('start-upload').disabled ||= selectingSource;
   for (const button of $('folder-list').querySelectorAll('[data-download-slice],[data-download-file]')) button.disabled = directoryBusy || managementBusy || selectingBundle || running || !outputDir;
-  const managementDisabled = directoryBusy || managementBusy || selectingBundle || batchSubmitting || !logged;
+  const managementDisabled = directoryBusy || managementBusy || selectingBundle || batchSubmitting || !logged || state.sync?.busy;
   for (const button of $('folder-list').querySelectorAll('[data-cloud-manage]')) button.disabled = managementDisabled;
   if (managementDisabled) closeFileMenu();
   for (const id of ['clear-history', 'clear-history-settings']) $(id).disabled = !state.tasks.some(task => task.state === 'completed');
@@ -133,6 +135,7 @@ function render(next) {
   const changedAccount = (state.account?.uid || state.account?.label) !== (next.account?.uid || next.account?.label);
   if (next.tasks.some(task => task.type === 'upload' && task.state === 'completed' && !state.tasks.some(previous => previous.id === task.id && previous.state === 'completed'))) { cloudDirty = true; cloudRevision++; }
   state = next;
+  syncUI.render(state);
   if (state.settings) {
     outputDir = state.settings.downloadDir;
     $('output-directory').textContent = outputDir; $('output-directory').title = outputDir;
@@ -159,6 +162,13 @@ function render(next) {
     $('folder-list').setAttribute('aria-busy', 'false');
   }
   $('app-version').textContent = `v${state.version}`;
+  const restoreWindow = state.windowState?.maximized || state.windowState?.fullscreen;
+  const maximizeButton = $('window-maximize'), windowAction = restoreWindow ? '还原' : '最大化';
+  maximizeButton.title = windowAction; maximizeButton.setAttribute('aria-label', windowAction);
+  if (maximizeButton.dataset.icon !== (restoreWindow ? 'restore' : 'maximize')) {
+    maximizeButton.dataset.icon = restoreWindow ? 'restore' : 'maximize';
+    maximizeButton.replaceChildren(icon(maximizeButton.dataset.icon));
+  }
   if (changedAccount) $('account-options').open = !state.account;
   $('account-status').textContent = state.account ? `已登录 · ${state.account.label}` : '未登录';
   $('account-status').classList.toggle('connected', Boolean(state.account));
@@ -180,7 +190,7 @@ function refreshUploadedFiles() {
 }
 function switchTab(name) {
   closeFileMenu();
-  for (const item of ['upload','download','transfers','settings']) {
+  for (const item of ['upload','download','sync','transfers','settings']) {
     $(`${item}-panel`).hidden = item !== name;
     $(`tab-${item}`).classList.toggle('active', item === name);
     $(`tab-${item}`).setAttribute('aria-selected', String(item === name));
@@ -233,7 +243,7 @@ function selectDownload(file, event = {}, checkbox = false) {
   updateSelectionControls();
 }
 function updateSelectionControls() {
-  const busy = batchSubmitting || directoryBusy || managementBusy || selectingBundle;
+  const busy = batchSubmitting || directoryBusy || managementBusy || selectingBundle || state.sync?.busy;
   const boxes = [...$('folder-list').querySelectorAll('[data-download-select]')];
   for (const box of boxes) {
     box.checked = selectedDownloads.has(box.dataset.downloadSelect); box.disabled = busy;
@@ -634,6 +644,7 @@ $('confirm-login').addEventListener('click', () => run($('confirm-login'), async
 $('logout').addEventListener('click', () => run($('logout'), async () => { render(await api.call('logout')); clearBundle(); history = [{ id: '-1', name: '根目录' }]; $('folder-list').replaceChildren(make('p', 'muted', '登录后点击“刷新目录”。')); }));
 $('open-data').addEventListener('click', () => run($('open-data'), () => api.call('openData')));
 $('tab-upload').addEventListener('click', () => switchTab('upload'));
+$('tab-sync').addEventListener('click', () => switchTab('sync'));
 $('tab-download').addEventListener('click', () => switchTab('download'));
 $('new-folder').addEventListener('click', () => openCloudDialog('create'));
 $('cloud-form').addEventListener('submit', submitCloudChange);
@@ -714,10 +725,11 @@ dropZone.addEventListener('drop', event => {
     selectingSource = true; updateControls();
     try {
       setSource(await api.call('selectSource', { path: filePath }));
-      if (state.account && !state.tasks.some(task => task.state === 'running')) await startUpload();
+      if (state.account && !state.sync?.busy && !state.tasks.some(task => task.state === 'running')) await startUpload();
       else notice(state.account ? '文件已选中，当前任务完成或暂停后点击上传' : '文件已选中，登录后点击上传');
     } finally { selectingSource = false; updateControls(); }
   });
 });
+for (const [id, action] of [['window-minimize', 'windowMinimize'], ['window-maximize', 'windowToggleMaximize'], ['window-close', 'windowClose']]) $(id).addEventListener('click', () => run($(id), () => api.call(action)));
 api.onState(render);
 void api.call('state').then(render).catch(error => notice(error.message, true));

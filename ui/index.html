@@ -11,7 +11,14 @@
 <body>
   <header class="topbar">
     <div class="brand"><img class="logo" src="assets/app-icon.svg" width="34" height="34" alt="" aria-hidden="true"><h1>蓝奏切片</h1></div>
-    <div class="header-tags"><span>80 MiB 分片</span><span>校验后合并</span><span id="app-version">桌面版</span></div>
+    <div class="header-actions">
+      <div class="header-tags"><span>80 MiB 分片</span><span>校验后合并</span><span id="app-version">桌面版</span></div>
+      <div class="window-controls" role="group" aria-label="窗口控制">
+        <button id="window-minimize" class="window-button" type="button" aria-label="最小化" title="最小化" data-icon="minimize"></button>
+        <button id="window-maximize" class="window-button" type="button" aria-label="最大化" title="最大化" data-icon="maximize"></button>
+        <button id="window-close" class="window-button window-close" type="button" aria-label="关闭" title="关闭" data-icon="close"></button>
+      </div>
+    </div>
   </header>
   <main>
     <aside class="account-panel panel">
@@ -29,7 +36,7 @@
       <button id="open-data" class="text-button data-button">打开本地任务目录</button>
     </aside>
     <section class="workspace">
-      <nav class="tabs" aria-label="传输模式"><button id="tab-upload" class="tab active" aria-selected="true">切片上传</button><button id="tab-download" class="tab" aria-selected="false">下载与合并</button><button id="tab-transfers" class="tab" aria-selected="false">上传下载</button><button id="tab-settings" class="tab" aria-selected="false">设置与清理</button></nav>
+      <nav class="tabs" aria-label="传输模式"><button id="tab-upload" class="tab active" aria-selected="true">切片上传</button><button id="tab-download" class="tab" aria-selected="false">下载与合并</button><button id="tab-sync" class="tab" aria-selected="false">自动同步</button><button id="tab-transfers" class="tab" aria-selected="false">上传下载</button><button id="tab-settings" class="tab" aria-selected="false">设置与清理</button></nav>
       <section id="upload-panel" class="panel operation-panel">
         <div class="upload-heading"><h2>上传文件</h2><span id="upload-concurrency-label" class="muted small">上传并发 2 路</span></div>
         <button id="choose-source" class="file-picker"><span class="file-icon" data-icon="upload" aria-hidden="true"></span><strong id="source-name">点击选择文件，或拖到这里</strong><span id="source-path">已登录且空闲时，拖入即上传</span><span id="source-size" class="source-size" hidden></span></button>
@@ -49,6 +56,27 @@
         </form>
         <div id="bundle-summary" class="bundle-summary" hidden></div>
         <div class="download-settings"><button id="choose-directory" class="secondary">选择保存目录</button><span id="output-directory" class="muted">尚未选择</span><label for="concurrency">并发</label><select id="concurrency" title="更改后也保存为默认下载并发"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select><button id="start-download" class="primary" title="全部切片校验后自动合并，不覆盖已有文件" disabled>下载并合并 <span data-icon="download" aria-hidden="true"></span></button></div>
+      </section>
+      <section id="sync-panel" class="panel operation-panel" hidden>
+        <div class="upload-heading"><h2>自动同步</h2><span class="sync-badge">本地 → 蓝奏云</span></div>
+        <p class="muted small">按内容比对，未变化不上传；修改后先完成新版再清理旧版。软件运行或最小化时执行，完全退出后停止。</p>
+        <p id="sync-warning" class="sync-warning small" role="status" hidden></p>
+        <details id="sync-editor" class="sync-editor" open>
+          <summary id="sync-editor-title">新建同步规则</summary>
+          <form id="sync-form">
+            <label for="sync-name">规则名称（选填）</label><input id="sync-name" maxlength="100" placeholder="例如：工作文档">
+            <label for="sync-path">本地文件或文件夹路径</label>
+            <div class="sync-path-row"><input id="sync-path" required placeholder="选择文件、文件夹，或填写绝对路径"><button id="sync-pick-file" type="button" class="secondary compact">选文件</button><button id="sync-pick-folder" type="button" class="secondary compact">选文件夹</button></div>
+            <label>云端目标</label><div class="sync-path-row"><span id="sync-target" class="sync-target">根目录 / 本规则专用目录</span><button id="sync-pick-target" type="button" class="secondary compact">选择目录</button></div>
+            <p class="muted small sync-help">每条规则使用独立的兼容目录；子文件的相对路径保存在清单中。源路径与目标保存后固定，更换时请另建规则。</p>
+            <div class="sync-schedule-grid"><div><label for="sync-schedule">同步时间（电脑本地时间）</label><select id="sync-schedule"><option value="interval">按时间间隔</option><option value="daily">每天指定时间</option></select></div><div id="sync-interval-field"><label for="sync-minutes">间隔分钟</label><input id="sync-minutes" type="number" min="1" max="10080" value="30" required></div><div id="sync-daily-field" hidden><label for="sync-times">时间点，用逗号分隔</label><input id="sync-times" placeholder="09:00, 14:00, 20:30" maxlength="143"></div></div>
+            <div class="sync-options"><label class="checkbox"><input id="sync-enabled" type="checkbox" checked> 启用自动同步</label><label class="checkbox"><input id="sync-delete" type="checkbox"> 同步本地删除（默认关闭）</label></div>
+            <p class="muted small sync-help">同步删除只清理本规则已管理且本地已移除的文件。路径失效或扫描失败时不执行删除；更新后分享链接可能变化。</p>
+            <div class="sync-form-actions"><button id="sync-cancel" type="button" class="text-button" hidden>取消编辑</button><button id="sync-save" class="primary" type="submit">保存规则</button></div>
+          </form>
+        </details>
+        <div class="sync-list-heading"><h3>同步规则</h3><span id="sync-count" class="muted small">0 条</span></div>
+        <div id="sync-rules" aria-label="同步规则列表"><p class="empty-state">登录后创建第一条同步规则</p></div>
       </section>
       <section id="settings-panel" class="panel operation-panel" hidden>
         <h2>设置与清理</h2>
@@ -71,6 +99,8 @@
     </section>
   </main>
   <div id="notice" class="notice" role="status" hidden></div>
+  <dialog id="sync-confirm-dialog" class="cloud-dialog" aria-labelledby="sync-confirm-title"><h2 id="sync-confirm-title">确认操作</h2><p id="sync-confirm-text" class="small"></p><div class="sync-form-actions"><button id="sync-confirm-cancel" class="secondary">取消</button><button id="sync-confirm-ok" class="primary">确认</button></div></dialog>
+  <dialog id="sync-target-dialog" class="cloud-dialog" aria-labelledby="sync-target-title"><h2 id="sync-target-title">选择云端父目录</h2><p id="sync-target-path" class="small sync-target">根目录</p><div class="sync-path-row"><button id="sync-target-up" class="secondary compact">返回上级</button><button id="sync-target-close" class="text-button">取消</button></div><div id="sync-target-folders" class="sync-target-folders" aria-label="云端子文件夹"></div><div class="sync-form-actions"><button id="sync-target-more" class="text-button" hidden>加载更多</button><button id="sync-target-use" class="primary">使用当前目录</button></div></dialog>
   <div id="file-menu" class="file-menu" popover="auto" role="menu" aria-label="文件管理"></div>
   <dialog id="cloud-dialog" class="cloud-dialog" aria-labelledby="cloud-dialog-title" aria-describedby="cloud-dialog-description">
     <form id="cloud-form">

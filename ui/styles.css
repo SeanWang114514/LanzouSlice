@@ -20,12 +20,19 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 ::-webkit-scrollbar{width:12px;height:12px}
 ::-webkit-scrollbar-thumb{background:#b9bfce;border:3px solid transparent;background-clip:padding-box;border-radius:9px}
 ::-webkit-scrollbar-thumb:hover{background-color:#9ca4b7}
-.topbar{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:var(--surface);border-bottom:1px solid #d7dae5;box-shadow:0 3px 10px #c4c7d344}
+.topbar{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:var(--surface);border-bottom:1px solid #d7dae5;box-shadow:0 3px 10px #c4c7d344;app-region:drag;user-select:none}
 .brand{display:flex;align-items:center;gap:11px}
 .logo{display:block;width:34px;height:34px;flex-shrink:0}
 h1{font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;font-size:19px;letter-spacing:.5px;margin:0}
 .header-tags{display:flex;align-items:center;gap:14px;color:var(--muted);font-size:11px}
 .header-tags #app-version{border:1px solid var(--border);border-radius:5px;padding:3px 7px;font-family:var(--data-font);font-size:10px}
+.header-actions{display:flex;align-items:center;gap:20px}
+.window-controls{display:flex;align-items:center;gap:8px;padding-left:18px;border-left:1px solid var(--border);app-region:no-drag}
+.window-button{display:grid;place-items:center;width:32px;height:30px;padding:0;border:1px solid transparent;border-radius:9px;color:var(--muted);background:var(--surface);box-shadow:var(--control);app-region:no-drag}
+.window-button:hover{color:var(--accent-strong);border-color:#b9b1d5}
+.window-button:active{box-shadow:var(--inset)}
+.window-close:hover{color:var(--danger);background:var(--danger-wash);border-color:var(--danger-wash)}
+.window-button .ui-icon{width:14px;height:14px}
 main{display:grid;grid-template-columns:208px minmax(0,1fr);gap:20px;padding:18px 24px}
 .panel{background:var(--surface);border:1px solid #f6f7fb99;border-radius:16px;box-shadow:var(--raised)}
 .account-panel{align-self:start;position:sticky;top:18px;max-height:calc(100dvh - 100px);overflow:auto;padding:18px 16px}
@@ -63,6 +70,27 @@ input::placeholder{color:var(--muted)}
 .tabs{display:flex;gap:3px;width:fit-content;min-height:42px;padding:4px;margin:0 0 12px;background:var(--surface);border-radius:13px;box-shadow:var(--inset)}
 .tab{border:0;background:transparent;color:var(--muted);border-radius:9px;padding:7px 16px;font-size:13px;font-weight:600}
 .tab.active{background:var(--surface);color:var(--blue);box-shadow:var(--control)}
+.sync-badge{font-size:11px;color:var(--accent);background:var(--accent-wash);padding:3px 8px;border-radius:7px;white-space:nowrap}
+.sync-editor{border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin:16px 0;box-shadow:var(--inset)}
+.sync-editor>summary{font-size:13px;font-weight:600;color:var(--accent);padding:3px 0}
+.sync-path-row{display:flex;align-items:center;gap:8px;min-width:0}
+.sync-path-row>input,.sync-target{flex:1;min-width:0}
+.sync-target{font-size:12px;overflow-wrap:anywhere;line-height:1.8}
+.sync-help{margin:8px 0}
+.sync-schedule-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.sync-options{display:flex;flex-wrap:wrap;gap:8px 24px}
+.sync-options .checkbox{font-size:12px;margin:14px 0 0}
+.sync-form-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:14px}
+.sync-list-heading,.sync-rule-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.sync-list-heading h3,.sync-rule h3{font-size:14px;margin:0;overflow-wrap:anywhere;min-width:0}
+.sync-rule{padding:14px;margin-top:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:var(--control)}
+.sync-rule p{margin:8px 0;overflow-wrap:anywhere}
+.sync-rule-path{font-family:var(--data-font);font-size:12px;color:var(--muted)}
+.sync-rule-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.sync-result{font-variant-numeric:tabular-nums;color:var(--muted)}
+.sync-error,.sync-warning{color:var(--danger)}
+.sync-target-folders{display:grid;gap:8px;margin:14px 0;max-height:40dvh;overflow:auto;padding:4px}
+.sync-folder-choice{text-align:left;white-space:normal;overflow-wrap:anywhere}
 .operation-panel{padding:18px}
 .upload-heading,.download-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:12px;flex-shrink:0}
 .upload-heading h2,.download-heading h2{font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;font-size:17px;line-height:24px}
